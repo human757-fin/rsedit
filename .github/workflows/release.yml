@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag to build (without 'v', e.g. 0.1.0). Leave blank to use latest Cargo.toml version."
+        description: "Version tag to build (without 'v', e.g. 0.2.0). Leave blank to use latest Cargo.toml version."
         required: false
         type: string
 
@@ -30,6 +30,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install FFmpeg via vcpkg (shared / MSVC)
+        shell: pwsh
+        run: |
+          vcpkg install ffmpeg:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Resolve version
         id: version
         shell: pwsh
@@ -48,6 +54,17 @@ jobs:
           $root = "FastCutter-$ver"
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Copy-Item target\release\fast-cutter.exe "$root\FastCutter.exe"
+          # Bundle runtime DLLs so the portable zip is self-contained.
+          $vcpkgLibs = "$env:VCPKG_ROOT\installed\x64-windows\bin"
+          if (Test-Path $vcpkgLibs) {
+            Copy-Item "$vcpkgLibs\avcodec*.dll" "$root\" -ErrorAction SilentlyContinue
+            Copy-Item "$vcpkgLibs\avformat*.dll" "$root\" -ErrorAction SilentlyContinue
+            Copy-Item "$vcpkgLibs\avutil*.dll" "$root\" -ErrorAction SilentlyContinue
+            Copy-Item "$vcpkgLibs\swscale*.dll" "$root\" -ErrorAction SilentlyContinue
+            Copy-Item "$vcpkgLibs\swresample*.dll" "$root\" -ErrorAction SilentlyContinue
+            Copy-Item "$vcpkgLibs\avfilter*.dll" "$root\" -ErrorAction SilentlyContinue
+            Copy-Item "$vcpkgLibs\postproc*.dll" "$root\" -ErrorAction SilentlyContinue
+          }
           Copy-Item README.md "$root\README.md"
           Copy-Item LICENSE "$root\LICENSE.txt"
           Set-Content "$root\version.txt" $ver
@@ -74,7 +91,7 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    name: Build (Linux / portable)
+    name: Build (Linux / portable + AppImage)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
@@ -87,7 +104,11 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libavfilter-dev libswresample-dev \
+            libasound2-dev clang
 
       - uses: Swatinem/rust-cache@v2
 
@@ -183,16 +204,16 @@ jobs:
           body: |
             ## Fast Cutter
 
-            Automated build from the `fast-cutter` Rust codebase.
+            Full MVP: timeline, video/image/audio import, text overlays, audio mixing with fades/gain, and MP4 export.
 
             ### Downloads
 
             | File | Description |
             |---|---|
             | `FastCutter-Setup-*.exe` | Windows installer — downloads the latest portable build from GitHub and installs per-user (no admin). |
-            | `FastCutter-*-windows-portable.zip` | Windows portable build. Download, unzip, run `FastCutter.exe`. |
-            | `FastCutter-*-linux-x86_64.tar.gz` | Linux portable build. Extract and run `FastCutter`. |
-            | `FastCutter-*-x86_64.AppImage` | Linux AppImage. Download, `chmod +x`, run — no install required. |
+            | `FastCutter-*-windows-portable.zip` | Windows portable build (includes runtime FFmpeg DLLs). |
+            | `FastCutter-*-linux-x86_64.tar.gz` | Linux portable build. Requires `libavcodec` etc. on the system. |
+            | `FastCutter-*-x86_64.AppImage` | Linux AppImage. Self-contained, runs on most distros. |
 
             Verification: `SHA256SUMS.txt` contains checksums for every archive.
 
@@ -210,6 +231,8 @@ jobs:
             ### Linux (portable)
 
             ```sh
+            # Ubuntu/Debian: install runtime libs
+            sudo apt install libavcodec61 libavformat61 libswscale8 libavfilter10 libswresample5
             tar -xzf FastCutter-*-linux-x86_64.tar.gz
             ./FastCutter-*/FastCutter
             ```
