@@ -1,0 +1,124 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to build (without 'v', e.g. 0.1.0). Leave blank to use latest Cargo.toml version."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build (Windows / portable + installer)
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}"
+          if (-not $ver) { $ver = (Select-String '^version\s*=\s*"([^"]+)"' Cargo.toml).Matches[0].Groups[1].Value }
+          "value=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build app (release)
+        run: cargo build --release
+
+      - name: Stage portable build
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.value }}"
+          $root = "FastCutter-$ver"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item target\release\fast-cutter.exe "$root\FastCutter.exe"
+          Copy-Item README.md "$root\README.md"
+          Copy-Item LICENSE "$root\LICENSE.txt"
+          Set-Content "$root\version.txt" $ver
+          Compress-Archive -Path "$root\*" -DestinationPath "FastCutter-$ver-windows-portable.zip"
+          Get-ChildItem "FastCutter-$ver-windows-portable.zip" | Select-Object Name, Length
+
+      - name: Build installer (release)
+        run: cargo build --release --manifest-path installer/Cargo.toml
+
+      - name: Stage installer
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.value }}"
+          Copy-Item installer\target\release\fast-cutter-installer.exe "FastCutter-Setup-$ver.exe"
+          Get-ChildItem "FastCutter-Setup-$ver.exe" | Select-Object Name, Length
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: |
+            FastCutter-${{ steps.version.outputs.value }}-windows-portable.zip
+            FastCutter-Setup-${{ steps.version.outputs.value }}.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-dist
+          path: dist
+
+      - name: Determine tag name
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=v${{ needs.build-windows.outputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Fast Cutter ${{ steps.tag.outputs.name }}
+          body: |
+            ## Fast Cutter
+
+            Automated build from the `fast-cutter` Rust codebase.
+
+            ### Downloads
+
+            | File | Description |
+            |---|---|
+            | `FastCutter-Setup-*.exe` | Official installer — downloads the latest portable build from GitHub and installs per-user (no admin). |
+            | `FastCutter-*-windows-portable.zip` | Standalone portable build. Download, unzip, run `FastCutter.exe`. |
+
+            ### Install (GitHub-powered installer)
+
+            ```powershell
+            .\FastCutter-Setup-*.exe
+            ```
+
+            The installer fetches the latest portable build straight from this
+            repository's Release page, installs to
+            `%LOCALAPPDATA%\Programs\FastCutter`, creates a Start Menu shortcut,
+            and registers an Uninstall entry — all without needing an admin prompt.
+          files: |
+            dist/*

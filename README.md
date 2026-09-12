@@ -4,7 +4,7 @@ A minimal, fast, cross-platform video editor. Not a Resolve replacement — a
 lightweight cutting tool with basic audio, image/transparency, and subtitle
 support, built to never lag on the timeline.
 
-**Status: v0.1 technical spec draft — no code yet.**
+**Status: v0.1.0 — app shell + Windows release pipeline.**
 
 ## Goals
 
@@ -52,6 +52,32 @@ resample, and text rasterization happen on background thread pools.
 ## Spec
 
 The full technical specification lives in [`rsedit.md`](rsedit.md).
+
+## Building
+
+```sh
+cargo build --release        # desktop app (egui)
+cargo run                    # run the app
+```
+
+## Windows installer & releases
+
+Every tag pushed as `v*` (or a manual workflow run) builds on GitHub Actions
+and publishes a **Release** with two artifacts:
+
+| File | What it is |
+|---|---|
+| `FastCutter-Setup-*.exe` | A small bootstrap installer (`installer/`). It downloads the latest portable build straight from GitHub Releases **on the user's machine**, installs per-user to `%LOCALAPPDATA%\Programs\FastCutter` (no admin needed), creates a Start Menu shortcut, and registers an Uninstall entry. |
+| `FastCutter-*-windows-portable.zip` | Complete portable build: `FastCutter.exe` + docs. Download → unzip → run. |
+
+Want a release? Push a tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Or run the `release` workflow manually from the Actions tab.
 
 ## License
 

@@ -1,0 +1,16 @@
+[package]
+name = "fast-cutter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Fast Cutter - a minimal, fast, cross-platform video editor"
+license = "MIT"
+
+[dependencies]
+eframe = "0.31"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
