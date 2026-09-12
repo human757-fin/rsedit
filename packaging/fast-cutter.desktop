@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Fast Cutter
+Comment=A minimal, fast, cross-platform video editor
+Exec=fast-cutter
+Icon=fast-cutter
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=video;editor;cut;timeline;film;
+StartupNotify=true

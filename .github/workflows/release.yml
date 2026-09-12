@@ -73,15 +73,97 @@ jobs:
             FastCutter-Setup-${{ steps.version.outputs.value }}.exe
           if-no-files-found: error
 
+  build-linux:
+    name: Build (Linux / portable)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          ver="${{ inputs.version }}"
+          if [ -z "$ver" ]; then
+            ver=$(sed -n 's/^version\s*=\s*"\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          echo "value=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Build app (release)
+        run: cargo build --release
+
+      - name: Stage portable build
+        shell: bash
+        run: |
+          ver="${{ steps.version.outputs.value }}"
+          root="FastCutter-$ver-linux-x86_64"
+          mkdir -p "$root"
+          cp target/release/fast-cutter "$root/FastCutter"
+          cp README.md "$root/README.md"
+          cp LICENSE "$root/LICENSE.txt"
+          printf '%s\n' "$ver" > "$root/version.txt"
+          tar -czf "FastCutter-$ver-linux-x86_64.tar.gz" "$root"
+          ls -la "FastCutter-$ver-linux-x86_64.tar.gz"
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          ver="${{ steps.version.outputs.value }}"
+          appdir="FastCutter.AppDir"
+          mkdir -p "$appdir/usr/bin"
+          cp target/release/fast-cutter "$appdir/usr/bin/fast-cutter"
+          cp packaging/fast-cutter.desktop "$appdir/fast-cutter.desktop"
+          cp packaging/fast-cutter.png "$appdir/fast-cutter.png"
+          cp packaging/AppRun "$appdir/AppRun"
+          chmod +x "$appdir/AppRun" "$appdir/usr/bin/fast-cutter"
+
+          curl -sL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+          /tmp/appimagetool --appimage-extract-and-run "$appdir" "FastCutter-$ver-x86_64.AppImage"
+          ls -la "FastCutter-$ver-x86_64.AppImage"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: |
+            FastCutter-${{ steps.version.outputs.value }}-linux-x86_64.tar.gz
+            FastCutter-${{ steps.version.outputs.value }}-x86_64.AppImage
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: build-windows
+    needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: windows-dist
           path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-dist
+          path: dist
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          (cd dist && sha256sum FastCutter-* > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
 
       - name: Determine tag name
         id: tag
@@ -107,10 +189,14 @@ jobs:
 
             | File | Description |
             |---|---|
-            | `FastCutter-Setup-*.exe` | Official installer — downloads the latest portable build from GitHub and installs per-user (no admin). |
-            | `FastCutter-*-windows-portable.zip` | Standalone portable build. Download, unzip, run `FastCutter.exe`. |
+            | `FastCutter-Setup-*.exe` | Windows installer — downloads the latest portable build from GitHub and installs per-user (no admin). |
+            | `FastCutter-*-windows-portable.zip` | Windows portable build. Download, unzip, run `FastCutter.exe`. |
+            | `FastCutter-*-linux-x86_64.tar.gz` | Linux portable build. Extract and run `FastCutter`. |
+            | `FastCutter-*-x86_64.AppImage` | Linux AppImage. Download, `chmod +x`, run — no install required. |
 
-            ### Install (GitHub-powered installer)
+            Verification: `SHA256SUMS.txt` contains checksums for every archive.
+
+            ### Install (GitHub-powered Windows installer)
 
             ```powershell
             .\FastCutter-Setup-*.exe
@@ -120,5 +206,19 @@ jobs:
             repository's Release page, installs to
             `%LOCALAPPDATA%\Programs\FastCutter`, creates a Start Menu shortcut,
             and registers an Uninstall entry — all without needing an admin prompt.
+
+            ### Linux (portable)
+
+            ```sh
+            tar -xzf FastCutter-*-linux-x86_64.tar.gz
+            ./FastCutter-*/FastCutter
+            ```
+
+            ### Linux (AppImage)
+
+            ```sh
+            chmod +x FastCutter-*-x86_64.AppImage
+            ./FastCutter-*-x86_64.AppImage
+            ```
           files: |
             dist/*

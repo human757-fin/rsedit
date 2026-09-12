@@ -4,7 +4,7 @@ A minimal, fast, cross-platform video editor. Not a Resolve replacement — a
 lightweight cutting tool with basic audio, image/transparency, and subtitle
 support, built to never lag on the timeline.
 
-**Status: v0.1.0 — app shell + Windows release pipeline.**
+**Status: v0.1.1 — app shell + Windows/Linux release pipeline.**
 
 ## Goals
 
@@ -63,12 +63,16 @@ cargo run                    # run the app
 ## Windows installer & releases
 
 Every tag pushed as `v*` (or a manual workflow run) builds on GitHub Actions
-and publishes a **Release** with two artifacts:
+and publishes a **Release** with these artifacts:
 
 | File | What it is |
 |---|---|
 | `FastCutter-Setup-*.exe` | A small bootstrap installer (`installer/`). It downloads the latest portable build straight from GitHub Releases **on the user's machine**, installs per-user to `%LOCALAPPDATA%\Programs\FastCutter` (no admin needed), creates a Start Menu shortcut, and registers an Uninstall entry. |
-| `FastCutter-*-windows-portable.zip` | Complete portable build: `FastCutter.exe` + docs. Download → unzip → run. |
+| `FastCutter-*-windows-portable.zip` | Complete Windows portable build: `FastCutter.exe` + docs. Download → unzip → run. |
+| `FastCutter-*-linux-x86_64.tar.gz` | Complete Linux portable build: `FastCutter` binary + docs. Extract → run. |
+| `FastCutter-*-x86_64.AppImage` | Linux AppImage. Download, `chmod +x`, run — no install required. |
+
+`SHA256SUMS.txt` is published alongside every release for verification.
 
 Want a release? Push a tag:
 
