@@ -51,6 +51,9 @@ pub struct Asset {
     /// For Audio assets: fully decoded interleaved f32 PCM at project rate.
     #[serde(skip)]
     pub pcm: Option<Vec<f32>>,
+    /// For Video assets: a few evenly-spaced tiny frames (filmstrip preview).
+    #[serde(skip)]
+    pub filmstrip: Option<Vec<(u32, u32, Vec<u8>)>>,
 }
 
 impl Asset {
@@ -587,6 +590,7 @@ mod tests {
             rgba: None,
             thumb: None,
             pcm: None,
+            filmstrip: None,
         });
         p.video_tracks[0].clips.push(VideoClip {
             asset: id,

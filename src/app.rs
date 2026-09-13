@@ -269,6 +269,8 @@ pub struct FastCutterApp {
     fullscreen_preview: bool,
     relink_open: bool,
     recent_files: Vec<String>,
+    /// Where the current project was last saved (None = never saved).
+    current_project_path: Option<String>,
     // Undo / redo stacks
     undo_stack: Vec<Project>,
     redo_stack: Vec<Project>,
@@ -385,6 +387,7 @@ impl FastCutterApp {
             fullscreen_preview: false,
             relink_open: false,
             recent_files: recent,
+            current_project_path: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             autosave_timer: Instant::now(),
@@ -405,6 +408,7 @@ impl FastCutterApp {
         if self.undo_stack.len() > 100 {
             self.undo_stack.remove(0);
         }
+        self.dirty = true;
     }
 
     fn accent(&self) -> Color32 {
@@ -597,7 +601,129 @@ impl FastCutterApp {
                 self.export_open = false;
                 self.settings_open = false;
             }
+            // Fixed app-wide shortcuts (not user-rebindable).
+            let ctrl = i.modifiers.ctrl;
+            let shift = i.modifiers.shift;
+            if ctrl && !shift {
+                if i.key_pressed(Key::C) {
+                    self.copy_selected();
+                } else if i.key_pressed(Key::X) {
+                    self.cut_selected();
+                } else if i.key_pressed(Key::V) {
+                    self.paste_clip();
+                } else if i.key_pressed(Key::K) {
+                    self.toggle_palette();
+                } else if i.key_pressed(Key::M) {
+                    self.mixer_open = !self.mixer_open;
+                }
+            } else if shift && !ctrl {
+                let arrow = if i.key_pressed(Key::ArrowLeft) {
+                    Some(-1)
+                } else if i.key_pressed(Key::ArrowRight) {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(dir) = arrow {
+                    self.nudge_selected(dir);
+                }
+            }
+            if i.key_pressed(Key::F11) {
+                self.fullscreen_preview = !self.fullscreen_preview;
+            }
         });
+    }
+
+    fn toggle_palette(&mut self) {
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.palette_sel = 0;
+        }
+    }
+
+    fn copy_selected(&mut self) {
+        match self.selected {
+            Selection::Video { track, clip } => {
+                if let Some(c) = self.project.video_tracks[track].clips.get(clip) {
+                    self.clipboard = Some(ClipboardItem::Video(c.clone()));
+                    self.toasts.push(("Copied clip".into(), Instant::now()));
+                }
+            }
+            Selection::Audio { track, clip } => {
+                if let Some(c) = self.project.audio_tracks[track].clips.get(clip) {
+                    self.clipboard = Some(ClipboardItem::Audio(c.clone()));
+                    self.toasts.push(("Copied clip".into(), Instant::now()));
+                }
+            }
+            Selection::Text { track, clip } => {
+                if let Some(c) = self.project.text_tracks[track].clips.get(clip) {
+                    self.clipboard = Some(ClipboardItem::Text(c.clone()));
+                    self.toasts.push(("Copied clip".into(), Instant::now()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cut_selected(&mut self) {
+        self.copy_selected();
+        self.delete_selected();
+    }
+
+    fn paste_clip(&mut self) {
+        let Some(item) = self.clipboard.clone() else {
+            return;
+        };
+        let at = self.playhead_us;
+        self.push_undo();
+        match item {
+            ClipboardItem::Video(mut c) => {
+                c.timeline_start = at;
+                self.project.video_tracks[0].clips.push(c);
+            }
+            ClipboardItem::Audio(mut c) => {
+                c.timeline_start = at;
+                self.project.audio_tracks[0].clips.push(c);
+            }
+            ClipboardItem::Text(mut c) => {
+                let len = c.timeline_end - c.timeline_start;
+                let end = if len > 0 { at + len } else { at + 3 * SECOND_US };
+                c.timeline_start = at;
+                c.timeline_end = end;
+                self.project.text_tracks[0].clips.push(c);
+            }
+        }
+        self.audio.refresh(&self.project);
+        self.last_request = None;
+        self.toasts.push(("Pasted clip at playhead".into(), Instant::now()));
+    }
+
+    /// Nudge the selected clip left/right by one frame (Shift+arrows).
+    fn nudge_selected(&mut self, dir: i64) {
+        let per = (SECOND_US as f64 / self.project.fps).max(1.0) as i64;
+        let delta = dir * per;
+        match self.selected {
+            Selection::Video { track, clip } => {
+                if let Some(c) = self.project.video_tracks[track].clips.get_mut(clip) {
+                    c.timeline_start = (c.timeline_start + delta).max(0);
+                }
+            }
+            Selection::Audio { track, clip } => {
+                if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
+                    c.timeline_start = (c.timeline_start + delta).max(0);
+                }
+            }
+            Selection::Text { track, clip } => {
+                if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
+                    let len = c.timeline_end - c.timeline_start;
+                    c.timeline_start = (c.timeline_start + delta).max(0);
+                    c.timeline_end = c.timeline_start + len;
+                }
+            }
+            _ => return,
+        }
+        self.dirty = true;
+        self.audio.refresh(&self.project);
     }
 
     fn handle_capture(&mut self, ctx: &egui::Context) {
@@ -643,9 +769,7 @@ fn top_video_clip(p: &Project, t: Timecode) -> Option<(usize, &VideoClip)> {
     p.video_tracks.iter().enumerate().rev().find_map(|(ti, tr)| {
         tr.clips
             .iter()
-            .find(|c| {
-                c.timeline_start <= t && t < c.timeline_start + (c.source_out - c.source_in)
-            })
+            .find(|c| c.timeline_start <= t && t < c.timeline_start + c.on_timeline_us())
             .map(|c| (ti, c))
     })
 }
@@ -661,6 +785,20 @@ impl eframe::App for FastCutterApp {
             let pos = self.audio.pos_us();
             if pos > self.playhead_us as f64 {
                 self.playhead_us = pos as i64;
+            }
+            // Loop region: wrap playback back to the loop start instead of
+            // stopping at the end of the project.
+            if let (Some(ls), Some(le)) =
+                (self.project.loop_start, self.project.loop_end)
+            {
+                if le > ls
+                    && self.playhead_us >= le
+                    && self.playhead_us < self.project.duration_us()
+                {
+                    self.playhead_us = ls;
+                    self.audio.set_pos_us(ls as f64);
+                    self.playhead_us = self.audio.pos_us() as i64;
+                }
             }
             if self.playhead_us > self.project.duration_us().max(SECOND_US) {
                 self.playhead_us = 0;
@@ -715,6 +853,45 @@ impl eframe::App for FastCutterApp {
         if self.settings_open {
             self.settings_window(ctx);
         }
+        // Reap a finished export worker thread.
+        if self.export_running {
+            if let Some(h) = self.export_worker.take() {
+                if h.is_finished() {
+                    self.export_running = false;
+                    *self.export_progress_cell.lock().unwrap() = 1.0;
+                    match h.join() {
+                        Ok(Ok(())) => {
+                            self.export_msg = Some("Export complete.".into());
+                            self.export_progress = 1.0;
+                        }
+                        Ok(Err(e)) => {
+                            if e.to_string() == "export cancelled" {
+                                self.export_msg = Some("Export cancelled.".into());
+                                self.export_progress = 0.0;
+                            } else {
+                                self.export_msg = Some(format!("Export failed: {e:#}"));
+                                self.export_progress = 0.0;
+                            }
+                        }
+                        Err(_) => {
+                            self.export_msg = Some("Export thread panicked.".into());
+                            self.export_progress = 0.0;
+                        }
+                    }
+                } else {
+                    self.export_worker = Some(h);
+                }
+            }
+            self.export_progress = *self.export_progress_cell.lock().unwrap();
+        }
+        // Autosave every ~10s while the project is dirty.
+        if self.settings.autosave
+            && self.dirty
+            && self.autosave_timer.elapsed().as_secs() >= 10
+        {
+            crate::prefs::save_autosave(&self.project);
+            self.autosave_timer = Instant::now();
+        }
         self.fps_prompt_window(ctx);
         self.toast_overlay(ctx);
 
@@ -737,6 +914,42 @@ impl FastCutterApp {
             ui.add_space(2.0);
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.add(egui::Button::new("New project")).clicked() {
+                        ui.close_menu();
+                        self.new_project();
+                    }
+                    if ui.add(egui::Button::new("Open project...")).clicked() {
+                        ui.close_menu();
+                        self.prompt_open_project();
+                    }
+                    if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
+                        ui.close_menu();
+                        self.save_project();
+                    }
+                    if ui.add(egui::Button::new("Save as...")).clicked() {
+                        ui.close_menu();
+                        self.save_project_as();
+                    }
+                    if !self.recent_files.is_empty() {
+                        ui.menu_button("Open recent", |ui| {
+                            for p in self.recent_files.clone() {
+                                if ui.button(&format!("␣ {p}")).clicked() {
+                                    ui.close_menu();
+                                    self.load_project_file(&p);
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Clear recent files").clicked() {
+                                self.recent_files.clear();
+                                let _ = crate::prefs::write_config(
+                                    self.settings,
+                                    &self.keybinds.binds(),
+                                    &self.recent_files,
+                                );
+                            }
+                        });
+                    }
+                    ui.separator();
                     if ui
                         .add(egui::Button::new("Import media..."))
                         .clicked()
@@ -756,6 +969,36 @@ impl FastCutterApp {
                         ui.close_menu();
                         self.settings_open = true;
                     }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui
+                        .add(egui::Button::new("Command palette").shortcut_text("Ctrl+K"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.toggle_palette();
+                    }
+                    if ui
+                        .add(egui::Button::new("Mixer window").shortcut_text("Ctrl+M"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.mixer_open = !self.mixer_open;
+                    }
+                    if ui.button("Fullscreen preview").clicked() {
+                        ui.close_menu();
+                        self.fullscreen_preview = !self.fullscreen_preview;
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Loop {}· Ripple {}",
+                        if self.project.loop_start.is_some() {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        if self.project.ripple { "on" } else { "off" }
+                    ));
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui.add(egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
@@ -870,10 +1113,63 @@ impl FastCutterApp {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
+
+                let looping =
+                    self.project.loop_start.is_some() && self.project.loop_end.is_some();
+                if ui
+                    .add_sized(
+                        [58.0, 26.0],
+                        egui::SelectableLabel::new(looping, "Loop"),
+                    )
+                    .on_hover_text("Loop playback between the loop start and end points")
+                    .clicked()
+                {
+                    if looping {
+                        self.push_undo();
+                        self.project.loop_start = None;
+                        self.project.loop_end = None;
+                    } else if self.project.duration_us() > 0 {
+                        self.push_undo();
+                        let s = (self.playhead_us).min(
+                            (self.project.duration_us() - SECOND_US).max(0),
+                        );
+                        let e = (s + 4 * SECOND_US).min(self.project.duration_us()).max(s + 1);
+                        self.project.loop_start = Some(s);
+                        self.project.loop_end = Some(e);
+                    }
+                }
+                if ui
+                    .add_sized([60.0, 26.0], egui::Button::new("Marker").fill(BUTTON))
+                    .on_hover_text("Place a marker at the playhead")
+                    .clicked()
+                {
+                    self.push_undo();
+                    self.project.markers.push(crate::timeline::Marker {
+                        time_us: self.playhead_us,
+                        name: String::new(),
+                        color: [240, 180, 60],
+                    });
+                    self.project.markers.sort_by_key(|m| m.time_us);
+                }
+                if ui
+                    .add_sized(
+                        [58.0, 26.0],
+                        egui::SelectableLabel::new(self.project.ripple, "Ripple"),
+                    )
+                    .on_hover_text("Ripple (shift following clips when trimming/removing)")
+                    .clicked()
+                {
+                    self.push_undo();
+                    self.project.ripple = !self.project.ripple;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
                 if ui
                     .add_sized(
                         [60.0, 26.0],
-                        egui::Button::new("Export").fill(ACCENT),
+                        egui::Button::new("Export").fill(self.accent()),
                     )
                     .on_hover_text(shortcut_label(self.keybinds.export_render))
                     .clicked()
@@ -1469,6 +1765,18 @@ impl FastCutterApp {
 
     fn import_media(&mut self, path: PathBuf) {
         let path_s = path.to_string_lossy().into_owned();
+        let ext = std::path::Path::new(&path_s)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "srt" || ext == "vtt" {
+            if self.import_subtitles(&path_s) {
+                self.toasts.push(("Imported subtitles as text clips".into(), Instant::now()));
+            } else {
+                self.toasts.push(("Subtitle import failed".into(), Instant::now()));
+            }
+            return;
+        }
         match crate::assets::import_media(&mut self.project.assets, &path_s) {
             Ok(id) => {
                 // If the source is a video with a different frame rate, ask
@@ -1498,6 +1806,142 @@ impl FastCutterApp {
             }
             Err(e) => self.toasts.push((format!("Import failed: {e}"), Instant::now())),
         }
+    }
+
+    /// Import an SRT/VTT subtitle file as text clips on a new text track.
+    fn import_subtitles(&mut self, path: &str) -> bool {
+        let Ok(data) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let subs = crate::text::parse_subtitles(&data);
+        if subs.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        let track_idx = self.project.text_tracks.len();
+        self.project.text_tracks.push(crate::timeline::Track {
+            name: "Subtitles".to_string(),
+            clips: Vec::new(),
+            ..crate::timeline::Track::default()
+        });
+        for s in &subs {
+            let mut style = TextStyle::default();
+            style.font_size = 21.0;
+            style.color = [255, 255, 255, 255];
+            style.outline_color = [0, 0, 0, 200];
+            style.outline_width = 2.0;
+            style.shadow = true;
+            style.word_wrap = 0.0;
+            let mut tr = Transform::default();
+            tr.y = 0.85;
+            self.project.text_tracks[track_idx].clips.push(TextClip {
+                text: s.text.clone(),
+                timeline_start: s.start_us,
+                timeline_end: s.end_us,
+                style,
+                transform: tr,
+                opacity: 1.0,
+            });
+        }
+        self.selected = Selection::None;
+        true
+    }
+
+    fn new_project(&mut self) {
+        self.push_undo();
+        self.project = Project::new();
+        self.selected = Selection::None;
+        self.multi_selection.clear();
+        self.clipboard = None;
+        self.last_request = None;
+        self.playhead_us = 0;
+        self.audio.refresh(&self.project);
+        crate::prefs::clear_autosave();
+        self.current_project_path = None;
+        self.dirty = false;
+        self.toasts.push(("New project".into(), Instant::now()));
+    }
+
+    fn prompt_open_project(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("Fast Cutter project", &["rsedit"])
+            .pick_file()
+        {
+            self.load_project_file(&p.to_string_lossy().into_owned());
+        }
+    }
+
+    fn load_project_file(&mut self, path: &str) {
+        match crate::prefs::load_project_file(path) {
+            Ok(p) => {
+                self.push_undo();
+                self.project = p;
+                self.selected = Selection::None;
+                self.multi_selection.clear();
+                self.last_request = None;
+                self.playhead_us = 0;
+                self.audio.refresh(&self.project);
+                crate::prefs::clear_autosave();
+                self.current_project_path = Some(path.to_string());
+                self.dirty = false;
+                self.add_recent(path);
+                self.toasts.push((format!("Opened {path}"), Instant::now()));
+            }
+            Err(e) => self.toasts.push((format!("Open failed: {e:#}"), Instant::now())),
+        }
+    }
+
+    pub fn save_project(&mut self) {
+        if let Some(p) = self.current_project_path.clone() {
+            match crate::prefs::save_project_file(&p, &self.project) {
+                Ok(()) => {
+                    crate::prefs::clear_autosave();
+                    self.dirty = false;
+                    self.autosave_timer = Instant::now();
+                    self.add_recent(&p);
+                    self.toasts.push(("Project saved".into(), Instant::now()));
+                }
+                Err(e) => self.toasts.push((format!("Save failed: {e:#}"), Instant::now())),
+            }
+        } else {
+            self.save_project_as();
+        }
+    }
+
+    pub fn save_project_as(&mut self) {
+        let mut default = self.current_project_path.clone().unwrap_or_else(|| "project.rsedit".into());
+        if !default.ends_with(".rsedit") {
+            default.push_str(".rsedit");
+        }
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("Fast Cutter project", &["rsedit"])
+            .set_file_name(default)
+            .save_file()
+        {
+            let p = p.to_string_lossy().into_owned();
+            match crate::prefs::save_project_file(&p, &self.project) {
+                Ok(()) => {
+                    crate::prefs::clear_autosave();
+                    self.current_project_path = Some(p.clone());
+                    self.dirty = false;
+                    self.autosave_timer = Instant::now();
+                    self.add_recent(&p);
+                    self.toasts.push((format!("Saved as {p}"), Instant::now()));
+                }
+                Err(e) => self.toasts.push((format!("Save failed: {e:#}"), Instant::now())),
+            }
+        }
+    }
+
+    fn add_recent(&mut self, path: &str) {
+        self.recent_files.retain(|p| p != path);
+        self.recent_files.insert(0, path.to_string());
+        self.recent_files.truncate(8);
+        let _ = crate::prefs::write_config(
+            self.settings,
+            &self.keybinds.binds(),
+            &self.recent_files,
+        );
     }
 
     fn remove_asset(&mut self, id: AssetId) {

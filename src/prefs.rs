@@ -65,6 +65,20 @@ pub fn save_autosave(project: &Project) {
     }
 }
 
+/// Save a project to a user-chosen `.rsedit` file.
+pub fn save_project_file(path: &str, project: &Project) -> anyhow::Result<()> {
+    let data = serde_json::to_string_pretty(project)?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+/// Load a `.rsedit` project file.
+pub fn load_project_file(path: &str) -> anyhow::Result<Project> {
+    let data = std::fs::read_to_string(path)?;
+    let p: Project = serde_json::from_str(&data)?;
+    Ok(p)
+}
+
 pub fn load_autosave() -> Option<Project> {
     let data = std::fs::read_to_string(autosave_path()).ok()?;
     serde_json::from_str(&data).ok()

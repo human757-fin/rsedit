@@ -333,6 +333,35 @@ pub fn video_thumbnail(path: &str, tw: u32, th: u32) -> Result<(u32, u32, Vec<u8
     }
 }
 
+/// Sample `n` evenly-spaced frames across a video (filmstrip). Each sample is a
+/// small RGBA8 frame; undecodable points are skipped.
+pub fn video_filmstrip(
+    path: &str,
+    tw: u32,
+    th: u32,
+    n: usize,
+    duration_us: i64,
+) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut src = match VideoSource::open(path, tw.max(1), th.max(1)) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let mut out = Vec::new();
+    if n == 0 || duration_us <= 0 {
+        return out;
+    }
+    for i in 0..n {
+        let t = (duration_us as u64 * i as u64 / n.max(1) as u64) as i64;
+        if let Ok(Some(f)) = src.frame_at(t) {
+            let w = f.width.max(1);
+            let h = f.height.max(1);
+            let l = (w as usize * h as usize * 4).min(f.rgba.len());
+            out.push((w, h, f.rgba[..l].to_vec()));
+        }
+    }
+    out
+}
+
 /// Bilinear downsample of an RGBA8 image into `tw`x`th` (keeps caller's box).
 pub fn scale_rgba(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
     let (w, h, tw, th) = (w.max(1), h.max(1), tw.max(1), th.max(1));

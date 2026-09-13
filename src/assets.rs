@@ -8,7 +8,17 @@ use crate::timeline::{Asset, AssetId, AssetKind, AssetStore};
 
 /// Import a video or audio file. If the file has audio we decode it to PCM and
 /// build waveform peaks (per spec). Images go through load_image_rgba.
+/// Importing a path that is already in the store is a no-op (returns the
+/// existing id) so drops/imports never create duplicates.
 pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
+    if let Some((id, _)) = store
+        .assets
+        .iter()
+        .find(|(_, a)| a.path == path)
+    {
+        return Ok(*id);
+    }
+
     let name = Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -49,6 +59,7 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
             rgba: Some(rgba),
             thumb,
             pcm: None,
+            filmstrip: None,
         }));
     }
 
@@ -89,9 +100,18 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
     }
 
     // First-frame thumbnail for video assets (aspect-preserving, max 96x54).
-    let thumb = if kind == AssetKind::Video && w > 0 && h > 0 {
+    let mut thumb = if kind == AssetKind::Video && w > 0 && h > 0 {
         let (tw, th) = fit_box(w, h, 96, 54);
         decoder::video_thumbnail(path, tw, th).ok()
+    } else {
+        None
+    };
+    // Filmstrip preview: a row of sampled frames used by the media panel.
+    let filmstrip = if kind == AssetKind::Video && w > 0 && h > 0 {
+        let (tw, th) = fit_box(w, h, 64, 36);
+        let strip = decoder::video_filmstrip(path, tw, th, 16, duration_us);
+        thumb = thumb.or_else(|| strip.first().cloned());
+        Some(strip)
     } else {
         None
     };
@@ -111,6 +131,7 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
         rgba: None,
         thumb,
         pcm,
+        filmstrip,
     }))
 }
 
