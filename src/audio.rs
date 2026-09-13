@@ -26,19 +26,23 @@ pub struct MixClip {
     pub source_in: i64,      // us
     pub source_out: i64,     // us
     pub timeline_start: i64, // us
-    pub gain: f32,           // linear
+    pub gain: f32,           // linear (base + track gain)
     pub fade_in: i64,        // us
     pub fade_out: i64,       // us
+    pub speed: f32,
+    pub envelope: Vec<(i64, f32)>, // (us rel. clip, linear gain)
 }
 
 /// Build the mix snapshot from the current project. Muted/missing clips are
 /// dropped here, so the callback stays allocation-free.
 pub fn build_snapshot(project: &Project) -> MixSnapshot {
     let mut clips = Vec::new();
+    let any_solo = project.audio_tracks.iter().any(|t| t.solo);
     for track in &project.audio_tracks {
-        if track.muted {
+        if track.muted || (any_solo && !track.solo) {
             continue;
         }
+        let track_gain = db_to_linear(track.gain_db);
         for clip in &track.clips {
             let Some(asset) = project.assets.get(clip.asset) else { continue };
             let Some(pcm) = asset.pcm.clone() else { continue };
@@ -48,15 +52,57 @@ pub fn build_snapshot(project: &Project) -> MixSnapshot {
                 source_in: clip.source_in,
                 source_out: clip.source_out,
                 timeline_start: clip.timeline_start,
-                gain: db_to_linear(clip.gain_db),
+                gain: db_to_linear(clip.gain_db) * track_gain,
                 fade_in: clip.fade_in_us,
                 fade_out: clip.fade_out_us,
+                speed: clip.speed.max(0.01),
+                envelope: clip.envelope.clone(),
             });
         }
     }
     MixSnapshot {
         clips,
-        master_gain: 1.0,
+        master_gain: project.master_gain,
+    }
+}
+
+/// Peak-to-full-scale level of an asset's decoded PCM (dB, <= 0.0), for
+/// normalize. Returns None when there is no PCM.
+pub fn asset_peak_db(pcm: &[f32]) -> f32 {
+    let mut peak = 0.0f32;
+    for &s in pcm {
+        let a = s.abs();
+        if a > peak {
+            peak = a;
+        }
+    }
+    if peak < 1e-6 {
+        -96.0
+    } else {
+        20.0 * peak.log10()
+    }
+}
+
+/// Linear gain of `clip.envelope` at `local_us` (0..Envelope n/a => 1.0).
+pub(crate) fn envelope_gain(env: &[(i64, f32)], local_us: i64) -> f32 {
+    if env.is_empty() {
+        return 1.0;
+    }
+    if env.len() == 1 {
+        return env[0].1;
+    }
+    for w in env.windows(2) {
+        let (t0, g0) = w[0];
+        let (t1, g1) = w[1];
+        if local_us >= t0 && local_us <= t1 {
+            let f = ((local_us - t0) as f32 / (t1 - t0).max(1) as f32).clamp(0.0, 1.0);
+            return g0 + (g1 - g0) * f;
+        }
+    }
+    if local_us < env[0].0 {
+        env[0].1
+    } else {
+        env[env.len() - 1].1
     }
 }
 
@@ -215,9 +261,8 @@ where
         for clip in &snapshot.clips {
             let in_ch = clip.channels.max(1);
             let src = clip.source_out.max(clip.source_in);
-            let clip_samples = src.saturating_sub(clip.source_in) as f64
-                * 48_000.0f64
-                / 1_000_000.0f64;
+            let clip_us = (src as f64 - clip.source_in as f64) / clip.speed.max(0.01) as f64;
+            let clip_samples = clip_us * 48_000.0f64 / 1_000_000.0f64;
             let start_s = (clip.timeline_start as f64 * out_rate as f64 / 1_000_000.0f64) as i64;
             let end_s = start_s + clip_samples as i64;
             for f in 0..frames {
@@ -226,19 +271,17 @@ where
                     continue;
                 }
                 let src_s = s - start_s; // sample index in clip
-                let src_sample = (src_s as f64 * 48_000.0 / out_rate as f64) as usize
-                    + (clip.source_in as f64 * 48_000.0 / 1_000_000.0f64) as usize;
-                let ts_us = clip.timeline_start as f64
-                    + src_s as f64 * 1_000_000.0 / out_rate as f64;
-                // gain envelope: fade in/out
-                let mut g = clip.gain;
-                if clip.fade_in > 0 && (ts_us - clip.timeline_start as f64) < clip.fade_in as f64 {
-                    g *= ((ts_us - clip.timeline_start as f64) / clip.fade_in as f64) as f32;
+                let local_us = src_s as f64 * 1_000_000.0 / out_rate as f64;
+                let src_sample_us = clip.source_in as f64 + local_us * clip.speed as f64;
+                let src_sample = (src_sample_us * 48_000.0 / 1_000_000.0f64) as usize;
+                // gain envelope: fades + keyframed volume envelope
+                let mut g = clip.gain * envelope_gain(&clip.envelope, local_us as i64);
+                if clip.fade_in > 0 && local_us < clip.fade_in as f64 {
+                    g *= (local_us / clip.fade_in as f64) as f32;
                 }
                 if clip.fade_out > 0 {
-                    let end_us = clip.timeline_start as f64
-                        + (clip.source_out - clip.source_in) as f64;
-                    let rem = end_us - ts_us;
+                    let end_us = clip_us;
+                    let rem = end_us - local_us;
                     if rem < clip.fade_out as f64 {
                         g *= (rem / clip.fade_out as f64) as f32;
                     }

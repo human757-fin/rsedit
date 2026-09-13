@@ -419,6 +419,8 @@ pub struct Track<T> {
     pub solo: bool,
     #[serde(default)]
     pub color: [u8; 3],
+    #[serde(default)]
+    pub gain_db: f32,
 }
 
 /// A whole editing project.
@@ -441,6 +443,8 @@ pub struct Project {
     pub markers: Vec<Marker>,
     #[serde(default)]
     pub ripple: bool,
+    #[serde(default)]
+    pub master_gain: f32,
 }
 
 const TRACK_COLORS: [[u8; 3]; 8] = [

@@ -197,8 +197,9 @@ fn drain_audio(
     Ok(())
 }
 
-/// Render one composition frame (RGBA, cfg-w x cfg-h) for export. Uses a
-/// private decoder pool so assets aren't reopened every frame.
+/// Render one composition frame (RGBA, cfg-w x cfg-h) for export using the
+/// same compositor as the preview. `dec` owns a private decoder pool so assets
+/// aren't reopened every frame.
 fn composition_frame(
     project: &Project,
     dec: &mut ExportDecoder,
@@ -206,77 +207,13 @@ fn composition_frame(
     w: u32,
     h: u32,
 ) -> Result<Vec<u8>> {
-    let mut out: Vec<u8> = vec![0; (w * h * 4) as usize];
-    render::clear_buffer(&mut out);
-
-    for track in &project.video_tracks {
-        for clip in &track.clips {
-            let Some(asset) = project.assets.get(clip.asset) else { continue };
-            let start = clip.timeline_start;
-            let duration = (clip.source_out - clip.source_in).max(0);
-            if pts_us < start || pts_us >= start + duration {
-                continue;
-            }
-            let local = pts_us - start;
-            let source_pts = clip.source_in + local;
-            match asset.kind {
-                AssetKind::Image => {
-                    if let Some(rgba) = &asset.rgba {
-                        render::blend_scaled(
-                            rgba,
-                            asset.width,
-                            asset.height,
-                            &mut out,
-                            w,
-                            h,
-                            &clip.transform,
-                            clip.opacity,
-                        );
-                    }
-                }
-                _ => {
-                    let f = dec
-                        .frame(asset.id.0, &asset.path, source_pts)
-                        .with_context(|| format!("decode {}", asset.path))?;
-                    if let Some(f) = f {
-                        render::blend_scaled(
-                            &f.rgba,
-                            f.width,
-                            f.height,
-                            &mut out,
-                            w,
-                            h,
-                            &clip.transform,
-                            clip.opacity,
-                        );
-                    }
-                }
-            }
+    let decoder = dec;
+    Ok(render::compose_frame(project, w, h, pts_us, |id, path, src, up_to| {
+        match decoder.frame(id, path, src, up_to) {
+            Ok(Some(f)) => Some(std::sync::Arc::new(f)),
+            _ => None,
         }
-    }
-
-    for track in &project.text_tracks {
-        for clip in &track.clips {
-            let start = clip.timeline_start;
-            let duration = (clip.timeline_end - clip.timeline_start).max(0);
-            if pts_us < start || pts_us >= start + duration {
-                continue;
-            }
-            let active = crate::text::text_to_subtitle(&clip.text, start, duration);
-            if pts_us >= active.start_us && pts_us < active.end_us {
-                render::draw_text_billboard(
-                    &mut out,
-                    w,
-                    h,
-                    &active.text,
-                    &clip.style,
-                    clip.transform,
-                    clip.opacity,
-                );
-            }
-        }
-    }
-    Ok(out)
+    }))
 }
 
 /// Sum of all active clips at `[sample_start, sample_start+n)` in interleaved
@@ -285,7 +222,8 @@ fn mix_span(mix: &crate::audio::MixSnapshot, start_sample: usize, n: usize, rate
     let mut buf = vec![0.0f32; n * 2];
     for clip in &mix.clips {
         let clip_channels = clip.channels.min(2);
-        let src_total = (clip.source_out.max(clip.source_in) - clip.source_in) as f64;
+        let speed = clip.speed.max(0.01);
+        let src_total = (clip.source_out.max(clip.source_in) - clip.source_in) as f64 / speed as f64;
         let start_s = (clip.timeline_start as f64 * rate as f64 / 1_000_000.0f64) as usize;
         let end_s = start_s + (src_total * rate as f64 / 1_000_000.0) as usize;
         for i in 0..n {
@@ -294,35 +232,37 @@ fn mix_span(mix: &crate::audio::MixSnapshot, start_sample: usize, n: usize, rate
                 continue;
             }
             let src_s = s - start_s;
-            let pcm_idx = (src_s as f64 * 48_000.0 / rate as f64) as usize
-                + (clip.source_in as f64 * 48_000.0 / 1_000_000.0) as usize;
-            let ts_us = clip.timeline_start as f64
-                + src_s as f64 * 1_000_000.0 / rate as f64;
-            let mut g = clip.gain;
-            if clip.fade_in > 0 && (ts_us - clip.timeline_start as f64) < clip.fade_in as f64 {
-                g *= ((ts_us - clip.timeline_start as f64) / clip.fade_in as f64) as f32;
+            let local_us = src_s as f64 * 1_000_000.0 / rate as f64;
+            let src_off_us = local_us * speed as f64;
+            let pcm_idx = (clip.source_in as f64 * 48_000.0 / 1_000_000.0
+                + src_off_us * 48_000.0 / 1_000_000.0) as usize;
+            let mut g = clip.gain * crate::audio::envelope_gain(&clip.envelope, local_us as i64);
+            if clip.fade_in > 0 && local_us < clip.fade_in as f64 {
+                g *= (local_us / clip.fade_in as f64) as f32;
             }
             if clip.fade_out > 0 {
-                let end_us = clip.timeline_start as f64 + src_total;
-                let rem = end_us - ts_us;
+                let rem = src_total - local_us;
                 if rem < clip.fade_out as f64 && rem >= 0.0 {
                     g *= (rem / clip.fade_out as f64) as f32;
                 }
             }
             for ch in 0..clip_channels {
                 let pcm_ch = if clip.channels > 1 { ch } else { 0 };
-                let pcm_idx = pcm_idx.saturating_mul(clip.channels).saturating_add(pcm_ch);
-                if pcm_idx < clip.pcm.len() {
-                    buf[i * 2 + ch] += clip.pcm[pcm_idx] * g;
+                let idx = pcm_idx.saturating_mul(clip.channels).saturating_add(pcm_ch);
+                if idx < clip.pcm.len() {
+                    buf[i * 2 + ch] += clip.pcm[idx] * g;
                 }
             }
             if clip_channels == 1 {
-                let pcm_idx = pcm_idx.saturating_mul(clip.channels);
-                if pcm_idx < clip.pcm.len() {
-                    buf[i * 2 + 1] += clip.pcm[pcm_idx] * g;
+                let idx = pcm_idx.saturating_mul(clip.channels);
+                if idx < clip.pcm.len() {
+                    buf[i * 2 + 1] += clip.pcm[idx] * g;
                 }
             }
         }
+    }
+    for v in buf.iter_mut() {
+        *v *= mix.master_gain;
     }
     buf
 }
@@ -346,7 +286,13 @@ impl ExportDecoder {
         Self { sources, w, h }
     }
 
-    fn frame(&mut self, asset: u64, path: &str, pts_us: i64) -> Result<Option<crate::decoder::VideoFrame>> {
+    fn frame(
+        &mut self,
+        asset: u64,
+        path: &str,
+        pts_us: i64,
+        _up_to: i64,
+    ) -> Result<Option<crate::decoder::VideoFrame>> {
         if !self.sources.contains_key(&asset) {
             let src = VideoSource::open(path, self.w, self.h)?;
             self.sources.insert(asset, src);
