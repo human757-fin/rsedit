@@ -88,7 +88,8 @@ and publishes a **Release** with these artifacts:
 
 | File | What it is |
 |---|---|
-| `FastCutter-Setup-*.exe` | A small bootstrap installer (`installer/`). It downloads the latest portable build straight from GitHub Releases **on the user's machine**, installs per-user to `%LOCALAPPDATA%\Programs\FastCutter` (no admin needed), creates a Start Menu shortcut, and registers an Uninstall entry. |
+| `FastCutter-Setup-*.exe` | A GUI bootstrap installer (`installer/`, built with egui). It downloads the latest portable build straight from GitHub Releases **on the user's machine**, installs per-user to `%LOCALAPPDATA%\Programs\FastCutter` (or `~/.local/share/FastCutter` on Linux), with live download progress, and togglable **Start Menu / applications-menu shortcut** and **desktop shortcut**. Registers a per-user Uninstall entry on Windows. |
+| `FastCutter-Setup-*-linux-x86_64` | The same GUI installer for Linux (applications-menu + desktop shortcuts). |
 | `FastCutter-*-windows-portable.zip` | Windows portable build: `FastCutter.exe` + runtime FFmpeg DLLs + docs. Download → unzip → run. |
 | `FastCutter-*-linux-x86_64.tar.gz` | Linux portable build. Requires runtime FFmpeg libs on the system (`libavcodec61` etc.). Extract → run. |
 | `FastCutter-*-x86_64.AppImage` | Linux AppImage. Self-contained, runs on most distros without installing anything. |

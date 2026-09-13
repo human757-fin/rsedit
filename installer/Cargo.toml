@@ -2,13 +2,17 @@
 name = "fast-cutter-installer"
 version = "0.1.1"
 edition = "2021"
-description = "Fast Cutter GitHub-powered installer"
+description = "Fast Cutter GUI installer"
 license = "MIT"
 
 [dependencies]
+eframe = "0.31"
 ureq = { version = "3", features = ["json"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+flate2 = "1"
+tar = "0.4"
+rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 zip = "2"
