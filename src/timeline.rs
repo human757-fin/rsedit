@@ -450,7 +450,7 @@ pub struct Project {
     pub master_gain: f32,
 }
 
-const TRACK_COLORS: [[u8; 3]; 8] = [
+pub const TRACK_COLORS: [[u8; 3]; 8] = [
     [70, 120, 210],
     [120, 200, 120],
     [230, 160, 70],

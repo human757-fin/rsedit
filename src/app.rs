@@ -18,7 +18,7 @@ use crate::decoder::ensure_ffmpeg;
 use crate::framecache::{FrameCache, FrameRequest};
 use crate::timeline::{
     AssetId, AssetKind, AudioClip, Project, TextAlign, TextClip, TextStyle, Timecode, Track,
-    Transform, VideoClip, SECOND_US,
+    Transform, VideoClip, SECOND_US, TRACK_COLORS,
 };
 
 // ── Keyboard shortcuts ───────────────────────────────────────────────────────
@@ -267,6 +267,7 @@ pub struct FastCutterApp {
     palette_filter: String,
     palette_sel: usize,
     fullscreen_preview: bool,
+    preview_zoom: f32,
     relink_open: bool,
     recent_files: Vec<String>,
     /// Where the current project was last saved (None = never saved).
@@ -305,6 +306,30 @@ enum TimelineDrag {
     Move { kind: u8, track: usize, clip: usize, grab_us: i64 },
     TrimL { kind: u8, track: usize, clip: usize },
     TrimR { kind: u8, track: usize, clip: usize },
+}
+
+#[derive(Clone, Copy)]
+enum PaletteAction {
+    Import,
+    NewProject,
+    OpenProject,
+    SaveProject,
+    SaveAs,
+    Export,
+    AddVideoTrack,
+    AddAudioTrack,
+    AddText,
+    Mark,
+    Split,
+    DeleteSel,
+    Loop,
+    Ripple,
+    Fullscreen,
+    Mixer,
+    Snap,
+    Margins,
+    Dark,
+    Preferences,
 }
 
 impl FastCutterApp {
@@ -385,6 +410,7 @@ impl FastCutterApp {
             palette_filter: String::new(),
             palette_sel: 0,
             fullscreen_preview: false,
+            preview_zoom: 1.0,
             relink_open: false,
             recent_files: recent,
             current_project_path: None,
@@ -503,6 +529,27 @@ impl FastCutterApp {
         if let Some(len) = len {
             if clip < len {
                 self.push_undo();
+                let removed_start = match sel {
+                    Selection::Video { track, clip } => {
+                        self.project.video_tracks[track].clips[clip].timeline_start
+                    }
+                    Selection::Audio { track, clip } => {
+                        self.project.audio_tracks[track].clips[clip].timeline_start
+                    }
+                    _ => self.project.text_tracks[track].clips[clip].timeline_start,
+                };
+                let removed_len = match sel {
+                    Selection::Video { track, clip } => {
+                        self.project.video_tracks[track].clips[clip].on_timeline_us()
+                    }
+                    Selection::Audio { track, clip } => {
+                        self.project.audio_tracks[track].clips[clip].on_timeline_us()
+                    }
+                    _ => {
+                        self.project.text_tracks[track].clips[clip].timeline_end
+                            - self.project.text_tracks[track].clips[clip].timeline_start
+                    }
+                };
                 if kind == 0 {
                     self.project.video_tracks[track].clips.remove(clip);
                 } else if kind == 1 {
@@ -511,6 +558,34 @@ impl FastCutterApp {
                     self.project.text_tracks[track].clips.remove(clip);
                 }
                 self.selected = Selection::None;
+                // Ripple: shift clips after the removed gap on the same track.
+                if self.project.ripple && removed_len > 0 {
+                    match kind {
+                        0 => {
+                            for c in self.project.video_tracks[track].clips.iter_mut() {
+                                if c.timeline_start >= removed_start {
+                                    c.timeline_start = (c.timeline_start - removed_len).max(0);
+                                }
+                            }
+                        }
+                        1 => {
+                            for c in self.project.audio_tracks[track].clips.iter_mut() {
+                                if c.timeline_start >= removed_start {
+                                    c.timeline_start = (c.timeline_start - removed_len).max(0);
+                                }
+                            }
+                        }
+                        _ => {
+                            for c in self.project.text_tracks[track].clips.iter_mut() {
+                                if c.timeline_start >= removed_start {
+                                    let len = c.timeline_end - c.timeline_start;
+                                    c.timeline_start = (c.timeline_start - removed_len).max(0);
+                                    c.timeline_end = c.timeline_start + len;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         self.audio.refresh(&self.project);
@@ -541,6 +616,7 @@ impl FastCutterApp {
                 let n = self.project.video_tracks.len() + 1;
                 self.project.video_tracks.push(Track {
                     name: format!("V{n}"),
+                    color: TRACK_COLORS[(n - 1) % TRACK_COLORS.len()],
                     ..Default::default()
                 });
             }
@@ -548,6 +624,7 @@ impl FastCutterApp {
                 let n = self.project.audio_tracks.len() + 1;
                 self.project.audio_tracks.push(Track {
                     name: format!("A{n}"),
+                    color: TRACK_COLORS[(n - 1) % TRACK_COLORS.len()],
                     ..Default::default()
                 });
             }
@@ -765,6 +842,33 @@ impl FastCutterApp {
     }
 }
 
+fn selection_equals(a: Selection, b: Selection) -> bool {
+    a == b
+}
+
+fn clip_time_start(p: &Project, kind: u8, track: usize, clip: usize) -> i64 {
+    match kind {
+        0 => p
+            .video_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.timeline_start)
+            .unwrap_or(0),
+        1 => p
+            .audio_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.timeline_start)
+            .unwrap_or(0),
+        _ => p
+            .text_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.timeline_start)
+            .unwrap_or(0),
+    }
+}
+
 fn top_video_clip(p: &Project, t: Timecode) -> Option<(usize, &VideoClip)> {
     p.video_tracks.iter().enumerate().rev().find_map(|(ti, tr)| {
         tr.clips
@@ -843,10 +947,23 @@ impl eframe::App for FastCutterApp {
         // width and the side panels stop at its top edge.
         self.menu_bar(ctx);
         self.transport_bar(ctx);
-        self.timeline(ctx);
-        self.media_panel(ctx);
-        self.inspector(ctx);
-        self.preview_panel(ctx);
+        if self.fullscreen_preview {
+            self.fullscreen_preview_window(ctx);
+        } else {
+            self.timeline(ctx);
+            self.media_panel(ctx);
+            self.inspector(ctx);
+            self.preview_panel(ctx);
+        }
+        if self.palette_open {
+            self.palette_window(ctx);
+        }
+        if self.mixer_open {
+            self.mixer_window(ctx);
+        }
+        if self.relink_open {
+            self.relink_window(ctx);
+        }
         if self.export_open {
             self.export_window(ctx);
         }
@@ -1421,41 +1538,467 @@ impl FastCutterApp {
     // ── Preview viewport (center) ────────────────────────────────────────────
     fn preview_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(tex) = &self.preview_texture {
-                let avail = ui.available_size();
-                let aspect = self.settings.preview_width as f32 / self.settings.preview_height as f32;
-                let mut size = avail;
-                if size.x / size.y > aspect {
-                    size.x = size.y * aspect;
-                } else {
-                    size.y = size.x / aspect;
-                }
-                if size.x < 8.0 || size.y < 8.0 {
-                    return;
-                }
-                let center = ui.available_rect_before_wrap().center();
-                let img_rect = Rect::from_center_size(center, size);
-                ui.painter()
-                    .rect_stroke(
-                        img_rect.shrink(1.0),
-                        2.0,
-                        egui::Stroke::new(1.0, TRACK),
-                        StrokeKind::Inside,
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Preview").strong().color(WHITE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized([74.0, 20.0], egui::Button::new("Fullscreen").small())
+                        .clicked()
+                    {
+                        self.fullscreen_preview = true;
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {}fps  {}x{}",
+                            timecode_string(self.playhead_us, self.project.fps),
+                            self.project.fps,
+                            self.settings.preview_width,
+                            self.settings.preview_height
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(GRAY),
                     );
-                let sized = egui::load::SizedTexture::new(tex.id(), size);
-                ui.put(
-                    img_rect,
-                    egui::Image::new(sized).fit_to_exact_size(size),
+                });
+            });
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Zoom").size(11.0).color(GRAY));
+                if ui.add_sized([30.0, 18.0], egui::Button::new("Fit").small()).clicked() {
+                    self.preview_zoom = 1.0;
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.preview_zoom, 0.1..=4.0)
+                        .logarithmic(true)
+                        .show_value(false),
                 );
+            });
+            ui.add_space(2.0);
+            ui.separator();
+            let tex = self.preview_texture.clone();
+            if let Some(tex) = tex {
+                self.paint_preview_image(ui, &tex);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical(|ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("No media in the preview").size(18.0).color(DIM));
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "Import media (File ▸ Import media…) and place clips on a timeline lane, or drop media onto a lane directly.",
+                                )
+                                .size(12.0)
+                                .color(GRAY),
+                            );
+                            ui.add_space(12.0);
+                            if ui.button("Import media…").clicked() {
+                                self.pick_and_import();
+                            }
+                            ui.add_space(4.0);
+                            if ui.button("Open command palette").clicked() {
+                                self.toggle_palette();
+                            }
+                        });
+                    });
+                });
             }
         });
+    }
+
+    fn paint_preview_image(&mut self, ui: &mut egui::Ui, tex: &egui::TextureHandle) {
+        let avail = ui.available_size();
+        if avail.x < 8.0 || avail.y < 8.0 {
+            return;
+        }
+        let aspect = self.settings.preview_width as f32 / self.settings.preview_height as f32;
+        let mut size = avail;
+        if size.x / size.y > aspect {
+            size.x = size.y * aspect;
+        } else {
+            size.y = size.x / aspect;
+        }
+        size *= self.preview_zoom;
+        if size.x < 8.0 || size.y < 8.0 {
+            return;
+        }
+        let center = ui.available_rect_before_wrap().center();
+        let img_rect = Rect::from_center_size(center, size);
+        ui.painter()
+            .rect_filled(egui::Rect::from_center_size(center, size + egui::vec2(12.0, 12.0)), 4.0, TRACK);
+        ui.painter()
+            .rect_stroke(
+                img_rect.shrink(1.0),
+                2.0,
+                egui::Stroke::new(1.0, DIM),
+                StrokeKind::Inside,
+            );
+        let sized = egui::load::SizedTexture::new(tex.id(), size);
+        ui.put(
+            img_rect,
+            egui::Image::new(sized).fit_to_exact_size(size),
+        );
+        if self.settings.safe_margins {
+            let p = ui.painter();
+            let inset = egui::vec2(size.x * 0.05, size.y * 0.05);
+            let inner = img_rect.shrink2(inset);
+            let guide = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50));
+            p.rect_stroke(inner, 0.0, guide, StrokeKind::Inside);
+            for f in [0.333, 0.667] {
+                p.line_segment(
+                    [
+                        egui::pos2(inner.min.x + inner.width() * f, inner.min.y),
+                        egui::pos2(inner.min.x + inner.width() * f, inner.max.y),
+                    ],
+                    guide,
+                );
+                p.line_segment(
+                    [
+                        egui::pos2(inner.min.x, inner.min.y + inner.height() * f),
+                        egui::pos2(inner.max.x, inner.min.y + inner.height() * f),
+                    ],
+                    guide,
+                );
+            }
+        }
+    }
+
+    fn fullscreen_preview_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Preview — fullscreen")
+            .id(egui::Id::new("fullscreen_preview"))
+            .title_bar(true)
+            .resizable(true)
+            .default_size(ctx.screen_rect().size() * 0.9)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Exit fullscreen").clicked() {
+                        self.fullscreen_preview = false;
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Fit").clicked() {
+                        self.preview_zoom = 1.0;
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut self.preview_zoom, 0.1..=4.0)
+                            .logarithmic(true)
+                            .show_value(false),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  (Esc to exit)",
+                            timecode_string(self.playhead_us, self.project.fps)
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(GRAY),
+                    );
+                });
+                ui.separator();
+                let tex = self.preview_texture.clone();
+                if let Some(tex) = tex {
+                    self.paint_preview_image(ui, &tex);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Nothing to preview").color(DIM));
+                    });
+                }
+            });
+        if !self.fullscreen_preview {
+            self.last_request = None;
+        }
+    }
+
+    // ── Command palette ────────────────────────────────────────────────────
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        let commands: [(&str, PaletteAction); 20] = [
+            ("Import media…", PaletteAction::Import),
+            ("New project", PaletteAction::NewProject),
+            ("Open project…", PaletteAction::OpenProject),
+            ("Save project", PaletteAction::SaveProject),
+            ("Save project as…", PaletteAction::SaveAs),
+            ("Export…", PaletteAction::Export),
+            ("Add video track", PaletteAction::AddVideoTrack),
+            ("Add audio track", PaletteAction::AddAudioTrack),
+            ("Add text / subtitles", PaletteAction::AddText),
+            ("Insert marker at playhead", PaletteAction::Mark),
+            ("Split clip at playhead", PaletteAction::Split),
+            ("Delete selection", PaletteAction::DeleteSel),
+            ("Toggle loop region", PaletteAction::Loop),
+            ("Toggle ripple mode", PaletteAction::Ripple),
+            ("Toggle preview fullscreen", PaletteAction::Fullscreen),
+            ("Toggle mixer window", PaletteAction::Mixer),
+            ("Toggle snap to playhead", PaletteAction::Snap),
+            ("Toggle safe margins", PaletteAction::Margins),
+            ("Toggle dark mode", PaletteAction::Dark),
+            ("Preferences…", PaletteAction::Preferences),
+        ];
+        egui::Window::new("Command palette")
+            .id(egui::Id::new("palette"))
+            .fixed_size([420.0, 320.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    let filter = &mut self.palette_filter;
+                    ui.add(
+                        egui::TextEdit::singleline(filter)
+                            .hint_text("Type a command…")
+                            .frame(true)
+                            .desired_width(f32::INFINITY),
+                    );
+                    let matched: Vec<usize> = commands
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (name, _))| {
+                            let f = filter.to_lowercase();
+                            f.is_empty() || name.to_lowercase().contains(&f)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if matched.is_empty() {
+                        ui.label("No matching commands");
+                        return;
+                    }
+                    if self.palette_sel >= matched.len() {
+                        self.palette_sel = 0;
+                    }
+                    let key = ui.input(|i| {
+                        i.key_pressed(egui::Key::ArrowDown) as i32
+                            - i.key_pressed(egui::Key::ArrowUp) as i32
+                    });
+                    if key != 0 {
+                        let n = matched.len() as i32;
+                        self.palette_sel =
+                            (self.palette_sel as i32 + key + n) as usize % matched.len();
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("palette_list")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for (i, &ci) in matched.iter().enumerate() {
+                                let (name, _act) = commands[ci];
+                                let selected = i == self.palette_sel;
+                                if ui
+                                    .selectable_label(selected, RichText::new(name).size(13.0))
+                                    .clicked()
+                                {
+                                    self.run_palette(ctx, commands[ci].1);
+                                    return;
+                                }
+                            }
+                        });
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter && !matched.is_empty() {
+                        self.run_palette(ctx, commands[matched[self.palette_sel]].1);
+                        return;
+                    }
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if esc {
+                        self.palette_open = false;
+                    }
+                });
+            });
+    }
+
+    fn run_palette(&mut self, ctx: &egui::Context, a: PaletteAction) {
+        self.palette_open = false;
+        self.palette_filter.clear();
+        self.palette_sel = 0;
+        match a {
+            PaletteAction::Import => self.pick_and_import(),
+            PaletteAction::NewProject => self.new_project(),
+            PaletteAction::OpenProject => self.prompt_open_project(),
+            PaletteAction::SaveProject => self.save_project(),
+            PaletteAction::SaveAs => self.save_project_as(),
+            PaletteAction::Export => self.export_open = true,
+            PaletteAction::AddVideoTrack => self.add_track(0),
+            PaletteAction::AddAudioTrack => self.add_track(1),
+            PaletteAction::AddText => {
+                let n = self.project.text_tracks.len();
+                self.project.text_tracks.push(crate::timeline::Track {
+                    name: format!("Text {}", n + 1),
+                    clips: Vec::new(),
+                    ..crate::timeline::Track::default()
+                });
+                self.push_undo();
+            }
+            PaletteAction::Mark => {
+                let name = format!("Marker {}", self.project.markers.len() + 1);
+                self.project.markers.push(crate::timeline::Marker {
+                    time_us: self.playhead_us.max(0),
+                    name,
+                    color: [240, 180, 60],
+                });
+                self.push_undo();
+            }
+            PaletteAction::Split => self.split_selected(),
+            PaletteAction::DeleteSel => self.delete_selected(),
+            PaletteAction::Loop => {
+                if self.project.loop_start.is_some() && self.project.loop_end.is_some() {
+                    self.project.loop_start = None;
+                    self.project.loop_end = None;
+                } else {
+                    let a = (self.playhead_us - SECOND_US).max(0);
+                    let b = (self.playhead_us + SECOND_US).max(1);
+                    self.project.loop_start = Some(a);
+                    self.project.loop_end = Some(b);
+                }
+            }
+            PaletteAction::Ripple => self.project.ripple = !self.project.ripple,
+            PaletteAction::Fullscreen => self.fullscreen_preview = !self.fullscreen_preview,
+            PaletteAction::Mixer => self.mixer_open = !self.mixer_open,
+            PaletteAction::Snap => {
+                self.settings.snap_to_playhead = !self.settings.snap_to_playhead;
+            }
+            PaletteAction::Margins => self.settings.safe_margins = !self.settings.safe_margins,
+            PaletteAction::Dark => {
+                self.settings.dark_mode = !self.settings.dark_mode;
+                apply_theme(ctx, self.settings.dark_mode, self.settings.accent);
+            }
+            PaletteAction::Preferences => self.settings_open = true,
+        }
+    }
+
+    // ── Mixer ──────────────────────────────────────────────────────────────
+    fn mixer_window(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        egui::Window::new("Mixer")
+            .id(egui::Id::new("mixer"))
+            .resizable(true)
+            .default_size([340.0, 420.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Master").strong().color(WHITE));
+                    ui.add(
+                        egui::Slider::new(&mut self.project.master_gain, -60.0..=6.0)
+                            .text("dB")
+                            .suffix(""),
+                    );
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let gains: Vec<(usize, String)> = self
+                        .project
+                        .audio_tracks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (i, t.name.clone()))
+                        .collect();
+                    for (i, name) in gains {
+                        ui.push_id(("mix", i), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&name).size(12.0).color(GRAY));
+                                let mut muted = self.project.audio_tracks[i].muted;
+                                let mut solo = self.project.audio_tracks[i].solo;
+                                if ui.selectable_label(muted, "M").clicked() {
+                                    muted = !muted;
+                                    changed = true;
+                                }
+                                if ui.selectable_label(solo, "S").clicked() {
+                                    solo = !solo;
+                                    changed = true;
+                                }
+                                if changed {
+                                    self.project.audio_tracks[i].muted = muted;
+                                    self.project.audio_tracks[i].solo = solo;
+                                }
+                            });
+                            let db = self.project.audio_tracks[i].gain_db;
+                            let mut db = db;
+                            if ui
+                                .add(egui::Slider::new(&mut db, -60.0..=12.0).text("dB"))
+                                .changed()
+                            {
+                                self.project.audio_tracks[i].gain_db = db;
+                                changed = true;
+                            }
+                        });
+                    }
+                });
+            });
+        if changed {
+            self.dirty = true;
+            self.audio.refresh(&self.project);
+        }
+    }
+
+    // ── Relink media ───────────────────────────────────────────────────────
+    fn relink_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Relink media")
+            .id(egui::Id::new("relink"))
+            .resizable(true)
+            .default_size([520.0, 360.0])
+            .show(ctx, |ui| {
+                let missing: Vec<AssetId> = self
+                    .project
+                    .assets
+                    .assets
+                    .iter()
+                    .filter(|(_, a)| a.path.is_empty() || !std::path::Path::new(&a.path).exists())
+                    .map(|(id, _)| *id)
+                    .collect();
+                if missing.is_empty() {
+                    ui.label("All media files are reachable.");
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for id in missing {
+                        let asset = self.project.assets.assets.get(&id).cloned();
+                        let Some(asset) = asset else {
+                            continue;
+                        };
+                        let a_name = asset.name.clone();
+                        let a_path = asset.path.clone();
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&a_name).size(12.0).color(WHITE));
+                                ui.label(RichText::new(&a_path).size(10.0).color(DIM));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Relink…").clicked() {
+                                    if let Some(f) = rfd::FileDialog::new()
+                                        .add_filter("Media", &["mp4", "mov", "mkv", "webm", "m4v", "mp3", "wav", "ogg", "flac", "jpg", "jpeg", "png"])
+                                        .pick_file()
+                                    {
+                                        let p = f.to_string_lossy().to_string();
+                                        let is_video = matches!(
+                                            asset.kind,
+                                            crate::timeline::AssetKind::Video
+                                        );
+                                        if let Some(a) = self.project.assets.assets.get_mut(&id) {
+                                            a.path = p.clone();
+                                            a.name = std::path::Path::new(&p)
+                                                .file_name()
+                                                .map(|s| s.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| a_name.clone());
+                                            a.peaks.clear();
+                                            a.pcm = None;
+                                            if is_video {
+                                                a.filmstrip = None;
+                                            }
+                                        }
+                                        self.toasts.push(
+                                            ("Asset relinked".into(), std::time::Instant::now()),
+                                        );
+                                        self.dirty = true;
+                                    }
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+            });
     }
 
     // ── Timeline (bottom) ────────────────────────────────────────────────────
     fn timeline(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
-            .default_height(220.0)
+            .default_height(240.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -1469,6 +2012,19 @@ impl FastCutterApp {
                     }
                     if ui.small_button("+ Audio track").clicked() {
                         self.add_track(1);
+                    }
+                    ui.add_space(6.0);
+                    if ui.small_button("−").clicked() {
+                        self.timeline_zoom = (self.timeline_zoom * 0.85).max(4.0);
+                    }
+                    if ui.small_button("+").clicked() {
+                        self.timeline_zoom = (self.timeline_zoom * 1.18).min(3000.0);
+                    }
+                    if ui.small_button("Fit").clicked() {
+                        let dur = self.project.duration_us().max(SECOND_US);
+                        let view_w = (ui.available_width() - 190.0).max(100.0);
+                        self.timeline_zoom =
+                            (view_w * SECOND_US as f32 / dur as f32).clamp(4.0, 3000.0);
                     }
                     ui.separator();
                     for i in 0..self.project.video_tracks.len() {
@@ -1488,236 +2044,950 @@ impl FastCutterApp {
                     }
                 });
                 ui.separator();
+                ui.add_space(2.0);
 
-                let usize_dur = self.project.duration_us().max(SECOND_US);
-                let w = ui.available_width().max(320.0);
-                let row_h = 34.0;
-                let ruler_h = 18.0;
+                let left_w = 150.0;
+                let ruler_h = 20.0;
+                let minimap_h = 16.0;
+                let row_h = 38.0;
+                let frame_us = (SECOND_US as f64 / self.project.fps.max(1.0)) as i64;
+                let dur_us = self.project.duration_us().max(SECOND_US);
                 let vid_rows = self.project.video_tracks.len().max(1);
                 let aud_rows = self.project.audio_tracks.len().max(1);
                 let txt_rows = self.project.text_tracks.len().max(1);
                 let total_rows = (vid_rows + aud_rows + txt_rows) as f32;
-                let total_h = ruler_h + total_rows * row_h;
+                let total_h = minimap_h + ruler_h + total_rows * row_h + 14.0;
+                let avail_h = ui.available_height().max(total_h + 10.0);
 
                 let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(w, total_h),
+                    egui::vec2(ui.available_width().max(320.0), avail_h),
                     Sense::click_and_drag(),
                 );
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 2.0, PANEL);
 
-                // Time ruler.
-                let sec_px = w / (usize_dur as f32 / SECOND_US as f32).max(1.0);
-                let mut s = 0;
-                let mut x = 0.0;
-                while x < w {
-                    painter.text(
-                        egui::pos2(rect.min.x + x + 2.0, rect.min.y + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{s}s"),
-                        egui::FontId::proportional(10.0),
-                        Color32::from_rgb(150, 150, 160),
-                    );
-                    s += 1;
-                    x += sec_px;
+                // Geometry helpers for time <-> px.
+                let content_min_x = rect.min.x + left_w;
+                let view_w = rect.width() - left_w;
+                let px_per_sec = self.timeline_zoom;
+                let scroll_us0 = self.timeline_scroll_us;
+                let total_px = dur_us as f32 / SECOND_US as f32 * px_per_sec;
+                let max_scroll = (total_px - view_w).max(0.0);
+                let scroll_px = ((scroll_us0 as f32 / SECOND_US as f32) * px_per_sec)
+                    .clamp(0.0, max_scroll);
+                let x_for = |t: i64| -> f32 {
+                    content_min_x + (t as f32 / SECOND_US as f32) * px_per_sec - scroll_px
+                };
+                let t_for = |px: f32| -> i64 {
+                    (scroll_us0 as f32
+                        + ((px - content_min_x + scroll_px) / px_per_sec) * SECOND_US as f32)
+                        as i64
+                };
+
+                // --- Zoom (Ctrl/Shift + wheel) and horizontal scroll (wheel) ---
+                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if rect.contains(p) && p.x > content_min_x {
+                        let (wheel, ctrl, shift) = ctx.input(|i| {
+                            (i.smooth_scroll_delta.y, i.modifiers.ctrl, i.modifiers.shift)
+                        });
+                        if wheel != 0.0 {
+                            if ctrl || shift {
+                                // Zoom keeping the time under the cursor stable.
+                                let cursor_t = t_for(p.x);
+                                let cursor_dx = p.x - content_min_x + scroll_px;
+                                let nz = (px_per_sec * (1.0 + wheel * 0.06))
+                                    .clamp(4.0, 3000.0);
+                                let scroll_us_new = (cursor_t as f32 / SECOND_US as f32) * nz
+                                    - cursor_dx / nz * SECOND_US as f32;
+                                self.timeline_zoom = nz;
+                                let max_s = (dur_us as f32 / SECOND_US as f32 * nz - view_w)
+                                    .max(0.0);
+                                self.timeline_scroll_us =
+                                    scroll_us_new.max(0.0).min(max_s) as i64;
+                            } else if rect.contains(p) {
+                                let dr = wheel * 60.0 * px_per_sec * 0.05;
+                                self.timeline_scroll_us =
+                                    ((self.timeline_scroll_us as f32 + dr).max(0.0)) as i64;
+                            }
+                        }
+                    }
                 }
 
-                // Track lanes.
-                let mut clicks: Vec<(usize, usize, u8, Rect)> = Vec::new();
-                // Simplify: draw lanes inline below.
+                // --- Track lanes (with headers) ---
                 let mut lane_rects: Vec<(u8, usize, Rect)> = Vec::new();
+                let mut clips: Vec<(u8, usize, usize, Rect, (i64, i64))> = Vec::new();
 
                 // Video lanes.
-                for (ti, tr) in self.project.clone().video_tracks.iter().enumerate() {
-                    let y0 = rect.min.y + ruler_h + ti as f32 * row_h;
-                    let lane = Rect::from_min_max(
+                for (ti, tr) in self.project.video_tracks.iter().enumerate() {
+                    let y0 = rect.min.y + minimap_h + ruler_h + ti as f32 * row_h;
+                    let header = Rect::from_min_max(
                         egui::pos2(rect.min.x, y0),
+                        egui::pos2(content_min_x, y0 + row_h - 3.0),
+                    );
+                    painter.rect_filled(header, 2.0, TRACK);
+                    let lane = Rect::from_min_max(
+                        egui::pos2(content_min_x, y0),
                         egui::pos2(rect.max.x, y0 + row_h - 3.0),
                     );
                     painter.rect_filled(lane, 2.0, TRACK);
+                    painter.rect_filled(
+                        Rect::from_min_size(lane.min, egui::vec2(2.0, lane.height())),
+                        0.0,
+                        Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]),
+                    );
+                    // Header text (muted tracks dimmed).
+                    let name_col = if tr.muted {
+                        Color32::from_rgb(110, 110, 118)
+                    } else {
+                        Color32::from_rgb(215, 215, 225)
+                    };
                     painter.text(
-                        lane.min + egui::vec2(4.0, (row_h - 12.0) / 2.0),
+                        header.min + egui::vec2(8.0, (row_h - 12.0) / 2.0),
                         egui::Align2::LEFT_CENTER,
-                        tr.name.clone(),
+                        if tr.muted { format!("{} 🔇", tr.name) } else { tr.name.clone() },
                         egui::FontId::proportional(11.0),
-                        Color32::from_rgb(180, 180, 190),
+                        name_col,
                     );
                     lane_rects.push((0, ti, lane));
                     for (ci, c) in tr.clips.iter().enumerate() {
-                        let cw = ((c.source_out - c.source_in) as f32 / usize_dur as f32 * w)
-                            .max(6.0);
-                        let cx = (c.timeline_start as f32 / usize_dur as f32 * w).max(0.0);
-                        let cr = Rect::from_min_max(
-                            egui::pos2(rect.min.x + cx + 2.0, y0 + 2.0),
-                            egui::pos2(rect.min.x + cx + cw - 2.0, y0 + row_h - 5.0),
-                        );
-                        painter.rect_filled(cr, 2.0, VIDEO_CLIP);
-                        painter.text(
-                            cr.min + egui::vec2(4.0, 4.0),
-                            egui::Align2::LEFT_TOP,
-                            &c_name(&self.project, c.asset),
-                            egui::FontId::proportional(10.0),
-                            WHITE,
-                        );
-                        if let Some(p) = response.hover_pos() {
-                            if cr.contains(p) && response.clicked() {
-                                clicks.push((ti, ci, 0u8, cr));
-                            }
+                        let cw = c.on_timeline_us() as f32 / SECOND_US as f32 * px_per_sec;
+                        let cx = x_for(c.timeline_start);
+                        if cx + cw < content_min_x || cx > rect.max.x {
+                            continue;
                         }
+                        let cr = Rect::from_min_max(
+                            egui::pos2(cx + 1.0, y0 + 3.0),
+                            egui::pos2(cx + cw - 1.0, y0 + row_h - 7.0),
+                        );
+                        painter.rect_filled(cr, 3.0, VIDEO_CLIP);
+                        clips.push((0, ti, ci, cr, (c.timeline_start, c.on_timeline_us())));
                     }
                 }
 
                 // Audio lanes.
-                for (ai, tr) in self.project.clone().audio_tracks.iter().enumerate() {
-                    let y0 = rect.min.y + ruler_h + (vid_rows + ai) as f32 * row_h;
-                    let lane = Rect::from_min_max(
+                for (ai, tr) in self.project.audio_tracks.iter().enumerate() {
+                    let y0 = rect.min.y + minimap_h + ruler_h + (vid_rows + ai) as f32 * row_h;
+                    let header = Rect::from_min_max(
                         egui::pos2(rect.min.x, y0),
+                        egui::pos2(content_min_x, y0 + row_h - 3.0),
+                    );
+                    painter.rect_filled(header, 2.0, TRACK);
+                    let lane = Rect::from_min_max(
+                        egui::pos2(content_min_x, y0),
                         egui::pos2(rect.max.x, y0 + row_h - 3.0),
                     );
                     painter.rect_filled(lane, 2.0, TRACK);
+                    painter.rect_filled(
+                        Rect::from_min_size(lane.min, egui::vec2(2.0, lane.height())),
+                        0.0,
+                        Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]),
+                    );
+                    let name_col = if tr.muted {
+                        Color32::from_rgb(110, 110, 118)
+                    } else {
+                        Color32::from_rgb(215, 215, 225)
+                    };
                     painter.text(
-                        lane.min + egui::vec2(4.0, (row_h - 12.0) / 2.0),
+                        header.min + egui::vec2(8.0, (row_h - 12.0) / 2.0),
                         egui::Align2::LEFT_CENTER,
-                        tr.name.clone(),
+                        if tr.muted { format!("{} 🔇", tr.name) } else { tr.name.clone() },
                         egui::FontId::proportional(11.0),
-                        Color32::from_rgb(180, 180, 190),
+                        name_col,
                     );
                     lane_rects.push((1, ai, lane));
                     for (ci, c) in tr.clips.iter().enumerate() {
-                        let cw = ((c.source_out - c.source_in) as f32 / usize_dur as f32 * w)
-                            .max(6.0);
-                        let cx = (c.timeline_start as f32 / usize_dur as f32 * w).max(0.0);
+                        let cw = c.on_timeline_us() as f32 / SECOND_US as f32 * px_per_sec;
+                        let cx = x_for(c.timeline_start);
+                        if cx + cw < content_min_x || cx > rect.max.x {
+                            continue;
+                        }
                         let cr = Rect::from_min_max(
-                            egui::pos2(rect.min.x + cx + 2.0, y0 + 4.0),
-                            egui::pos2(rect.min.x + cx + cw - 2.0, y0 + row_h - 7.0),
+                            egui::pos2(cx + 1.0, y0 + 3.0),
+                            egui::pos2(cx + cw - 1.0, y0 + row_h - 7.0),
                         );
-                        painter.rect_filled(cr, 2.0, AUDIO_CLIP);
-                        if let Some(asset) = self.project.assets.get(c.asset) {
-                            if self.settings.show_peaks && !asset.peaks.is_empty() {
-                                let pw = cr.width();
-                                let ph = cr.height();
-                                let n = asset.peaks.len();
-                                let step = (n as f32 / pw).ceil().max(1.0) as usize;
-                                let mut i = 0usize;
-                                let mut px = 0.0f32;
-                                while px < pw {
-                                    let mut max = 0.0f32;
-                                    let mut min = 0.0f32;
-                                    for _ in 0..step {
-                                        if i < n {
-                                            let (a, b) = asset.peaks[i];
-                                            max = max.max(b);
-                                            min = min.min(a);
-                                        }
-                                        i += 1;
-                                    }
-                                    let cxm = cr.min.x + px;
-                                    let mid = cr.center().y;
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(cxm, mid - max * ph * 0.5),
-                                            egui::pos2(cxm, mid - min * ph * 0.5),
-                                        ],
-                                        egui::Stroke::new(1.0, WAVE),
-                                    );
-                                    px += 1.0;
-                                }
-                            }
-                        }
-                        if let Some(p) = response.hover_pos() {
-                            if cr.contains(p) && response.clicked() {
-                                clicks.push((ai, ci, 1u8, cr));
-                            }
-                        }
+                        painter.rect_filled(cr, 3.0, AUDIO_CLIP);
+                        clips.push((1, ai, ci, cr, (c.timeline_start, c.on_timeline_us())));
                     }
                 }
 
                 // Text lanes.
-                for (ti, tr) in self.project.clone().text_tracks.iter().enumerate() {
-                    let y0 = rect.min.y + ruler_h + (vid_rows + aud_rows + ti) as f32 * row_h;
-                    let lane = Rect::from_min_max(
+                for (ti, tr) in self.project.text_tracks.iter().enumerate() {
+                    let y0 = rect.min.y
+                        + minimap_h
+                        + ruler_h
+                        + (vid_rows + aud_rows + ti) as f32 * row_h;
+                    let header = Rect::from_min_max(
                         egui::pos2(rect.min.x, y0),
+                        egui::pos2(content_min_x, y0 + row_h - 3.0),
+                    );
+                    painter.rect_filled(header, 2.0, TRACK);
+                    let lane = Rect::from_min_max(
+                        egui::pos2(content_min_x, y0),
                         egui::pos2(rect.max.x, y0 + row_h - 3.0),
                     );
                     painter.rect_filled(lane, 2.0, TRACK);
+                    painter.rect_filled(
+                        Rect::from_min_size(lane.min, egui::vec2(2.0, lane.height())),
+                        0.0,
+                        Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]),
+                    );
                     painter.text(
-                        lane.min + egui::vec2(4.0, (row_h - 12.0) / 2.0),
+                        header.min + egui::vec2(8.0, (row_h - 12.0) / 2.0),
                         egui::Align2::LEFT_CENTER,
                         tr.name.clone(),
                         egui::FontId::proportional(11.0),
-                        Color32::from_rgb(180, 180, 190),
+                        Color32::from_rgb(215, 215, 225),
                     );
+                    lane_rects.push((2, ti, lane));
                     for (ci, c) in tr.clips.iter().enumerate() {
-                        let cw = ((c.timeline_end - c.timeline_start) as f32 / usize_dur as f32 * w)
-                            .max(6.0);
-                        let cx = (c.timeline_start as f32 / usize_dur as f32 * w).max(0.0);
+                        let cw =
+                            (c.timeline_end - c.timeline_start) as f32 / SECOND_US as f32 * px_per_sec;
+                        let cx = x_for(c.timeline_start);
+                        if cx + cw < content_min_x || cx > rect.max.x {
+                            continue;
+                        }
                         let cr = Rect::from_min_max(
-                            egui::pos2(rect.min.x + cx + 2.0, y0 + 4.0),
-                            egui::pos2(rect.min.x + cx + cw - 2.0, y0 + row_h - 7.0),
+                            egui::pos2(cx + 1.0, y0 + 3.0),
+                            egui::pos2(cx + cw - 1.0, y0 + row_h - 7.0),
                         );
-                        painter.rect_filled(cr, 2.0, TEXT_CLIP);
-                        if let Some(p) = response.hover_pos() {
-                            if cr.contains(p) && response.clicked() {
-                                clicks.push((ti, ci, 2u8, cr));
+                        painter.rect_filled(cr, 3.0, TEXT_CLIP);
+                        clips.push((
+                            2,
+                            ti,
+                            ci,
+                            cr,
+                            (c.timeline_start, c.timeline_end - c.timeline_start),
+                        ));
+                    }
+                }
+
+                // --- Track header buttons (Mute / Solo / Lock) via ui.interact ---
+                let mut header_click: Option<(u8, usize, u8)> = None; // (kind, idx, btn 0=m,1=s,2=l)
+                let btn_sz = 16.0f32;
+                for lane in &lane_rects {
+                    let (kind, idx, lane_rect) = *lane;
+                    let (muted, solo, locked) = match kind {
+                        0 => {
+                            let tr = &self.project.video_tracks[idx];
+                            (tr.muted, tr.solo, tr.locked)
+                        }
+                        1 => {
+                            let tr = &self.project.audio_tracks[idx];
+                            (tr.muted, tr.solo, tr.locked)
+                        }
+                        _ => {
+                            let tr = &self.project.text_tracks[idx];
+                            (tr.muted, tr.solo, tr.locked)
+                        }
+                    };
+                    let mut bx = lane_rect.min.x - 56.0;
+                    let mut b = 0;
+                    while b < 3 {
+                        let label = ["M", "S", "L"][b];
+                        let kind = kind;
+                        if kind == 2 && b == 1 {
+                            b += 1;
+                            continue;
+                        }
+                        if b == 0 && (lane_rect.min.x - (bx + btn_sz)) < 2.0 {
+                            break;
+                        }
+                        let active = match b {
+                            0 => muted,
+                            1 => solo,
+                            _ => locked,
+                        };
+                        let br = Rect::from_min_size(
+                            egui::pos2(bx, lane_rect.center().y - btn_sz / 2.0),
+                            egui::vec2(btn_sz, btn_sz),
+                        );
+                        let id = ui.id().with(("t", kind, idx, b));
+                        let r = ui.interact(br, id, Sense::click());
+                        let bg = if active {
+                            self.accent()
+                        } else {
+                            Color32::from_rgb(55, 55, 63)
+                        };
+                        painter.rect_filled(br, 2.0, bg);
+                        if r.hovered() {
+                            painter.rect_stroke(
+                                br,
+                                2.0,
+                                egui::Stroke::new(1.0, WHITE),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        painter.text(
+                            br.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::monospace(9.0),
+                            WHITE,
+                        );
+                        if r.clicked() {
+                            header_click = Some((kind, idx, b as u8));
+                        }
+                        b += 1;
+                        bx -= btn_sz + 3.0;
+                    }
+                }
+                if let Some((kind, idx, b)) = header_click {
+                    self.push_undo();
+                    match b {
+                        0 => {
+                            if kind == 0 {
+                                self.project.video_tracks[idx].muted = !self.project.video_tracks[idx].muted;
+                            } else if kind == 1 {
+                                self.project.audio_tracks[idx].muted = !self.project.audio_tracks[idx].muted;
+                                self.audio.refresh(&self.project);
+                            }
+                        }
+                        1 => {
+                            if kind == 1 {
+                                self.project.audio_tracks[idx].solo = !self.project.audio_tracks[idx].solo;
+                                self.audio.refresh(&self.project);
+                            }
+                        }
+                        _ => {
+                            if kind == 0 {
+                                self.project.video_tracks[idx].locked = !self.project.video_tracks[idx].locked;
+                            } else if kind == 1 {
+                                self.project.audio_tracks[idx].locked = !self.project.audio_tracks[idx].locked;
+                            } else {
+                                self.project.text_tracks[idx].locked = !self.project.text_tracks[idx].locked;
                             }
                         }
                     }
                 }
 
-                // Selection on click.
-                if let Some((ti, ci, kind, _)) = clicks.last().copied() {
-                    self.selected = match kind {
-                        0 => Selection::Video { track: ti, clip: ci },
-                        1 => Selection::Audio { track: ti, clip: ci },
-                        _ => Selection::Text { track: ti, clip: ci },
-                    };
-                }
-
-                // Playhead.
-                let px = rect.min.x
-                    + (self.playhead_us as f32 / usize_dur as f32 * w).clamp(0.0, w);
-                painter.line_segment(
-                    [egui::pos2(px, rect.min.y), egui::pos2(px, rect.max.y)],
-                    egui::Stroke::new(2.0, PLAYHEAD),
-                );
-
-                // Click on ruler seeks.
-                if response.clicked() {
-                    if let Some(p) = response.hover_pos() {
-                        if p.y < rect.min.y + ruler_h {
-                            let frac = ((p.x - rect.min.x) / w).clamp(0.0, 1.0);
-                            self.playhead_us = (usize_dur as f64 * frac as f64) as i64;
-                            self.seek_marker();
+                // --- Timeline drag (move / trim) ---
+                if self.timeline_drag.is_some() {
+                    let release = ctx.input(|i| i.pointer.primary_released());
+                    let p = ctx.input(|i| i.pointer.interact_pos());
+                    if let Some(p) = p {
+                        if rect.contains(p) && !release {
+                            let t = t_for(p.x).max(0);
+                            match self.timeline_drag {
+                                Some(TimelineDrag::Move { kind, track, clip, grab_us }) => {
+                                    let new_start = (t - grab_us).max(0);
+                                    let snapped = self.snapped_time(new_start);
+                                    match kind {
+                                        0 => {
+                                            if let Some(c) = self
+                                                .project
+                                                .video_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                c.timeline_start = snapped;
+                                            }
+                                        }
+                                        1 => {
+                                            if let Some(c) = self
+                                                .project
+                                                .audio_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                c.timeline_start = snapped;
+                                            }
+                                        }
+                                        _ => {
+                                            if let Some(c) = self
+                                                .project
+                                                .text_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                let len = c.timeline_end - c.timeline_start;
+                                                c.timeline_start = snapped;
+                                                c.timeline_end = c.timeline_start + len;
+                                            }
+                                        }
+                                    }
+                                    self.dirty = true;
+                                }
+                                Some(TimelineDrag::TrimL { kind, track, clip }) => {
+                                    match kind {
+                                        0 => {
+                                            if let Some(c) = self
+                                                .project
+                                                .video_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                let s_in = c.source_at((t - c.timeline_start).max(0));
+                                                c.source_in = s_in.clamp(0, c.source_out - frame_us.max(1));
+                                            }
+                                        }
+                                        1 => {
+                                            if let Some(c) = self
+                                                .project
+                                                .audio_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                let s_in = c.source_at((t - c.timeline_start).max(0));
+                                                c.source_in = s_in.clamp(0, c.source_out - frame_us.max(1));
+                                            }
+                                        }
+                                        _ => {
+                                            if let Some(c) = self
+                                                .project
+                                                .text_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                let s = t.max(c.timeline_start + frame_us);
+                                                let s = s.min(c.timeline_end - frame_us.max(1));
+                                                c.timeline_start = s.max(0);
+                                                if c.timeline_end <= c.timeline_start {
+                                                    c.timeline_end = c.timeline_start + frame_us;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    self.dirty = true;
+                                }
+                                Some(TimelineDrag::TrimR { kind, track, clip }) => {
+                                    let info: Option<AudioClip> = match kind {
+                                        0 => self
+                                            .project
+                                            .video_tracks
+                                            .get(track)
+                                            .and_then(|tr| tr.clips.get(clip))
+                                            .cloned()
+                                            .map(|c| AudioClip {
+                                                asset: c.asset,
+                                                source_in: c.source_in,
+                                                source_out: c.source_out,
+                                                timeline_start: c.timeline_start,
+                                                ..AudioClip::default()
+                                            }),
+                                        1 => self
+                                            .project
+                                            .audio_tracks
+                                            .get(track)
+                                            .and_then(|tr| tr.clips.get(clip))
+                                            .cloned(),
+                                        _ => None,
+                                    };
+                                    if let Some(info) = info {
+                                        let max_out = self
+                                            .project
+                                            .assets
+                                            .get(info.asset)
+                                            .map(|a| a.duration_us)
+                                            .unwrap_or(info.source_out);
+                                        let local = (t - info.timeline_start).max(frame_us);
+                                        let usable =
+                                            (info.on_timeline_us() - frame_us.max(1)).max(1);
+                                        let s_out = info
+                                            .source_at(local.min(usable))
+                                            .clamp(info.source_in + frame_us.max(1), max_out);
+                                        if kind == 0 {
+                                            if let Some(c) = self
+                                                .project
+                                                .video_tracks
+                                                .get_mut(track)
+                                                .and_then(|tr| tr.clips.get_mut(clip))
+                                            {
+                                                c.source_out = s_out;
+                                            }
+                                        } else if let Some(c) = self
+                                            .project
+                                            .audio_tracks
+                                            .get_mut(track)
+                                            .and_then(|tr| tr.clips.get_mut(clip))
+                                        {
+                                            c.source_out = s_out;
+                                        }
+                                    }
+                                    if kind == 2 {
+                                        if let Some(c) = self
+                                            .project
+                                            .text_tracks
+                                            .get_mut(track)
+                                            .and_then(|tr| tr.clips.get_mut(clip))
+                                        {
+                                            let s = t.max(c.timeline_start + frame_us);
+                                            c.timeline_end = s;
+                                        }
+                                    }
+                                    self.dirty = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if release {
+                        self.timeline_drag = None;
+                        self.audio.refresh(&self.project);
+                        self.last_request = None;
+                    }
+                } else if response.dragged() {
+                    // Begin a drag when the pointer is over a clip (move) or a
+                    // trim handle.
+                    if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                        if rect.contains(p) {
+                            for (kind, track, clip, cr, _) in clips.iter().rev() {
+                                let (kind, track, clip, cr) = (*kind, *track, *clip, *cr);
+                                let hover_x = p.x;
+                                if cr.contains(p) {
+                                    if hover_x <= cr.min.x + 6.0 {
+                                        self.push_undo();
+                                        self.timeline_drag = Some(TimelineDrag::TrimL {
+                                            kind,
+                                            track,
+                                            clip,
+                                        });
+                                    } else if hover_x >= cr.max.x - 6.0 {
+                                        self.push_undo();
+                                        self.timeline_drag = Some(TimelineDrag::TrimR {
+                                            kind,
+                                            track,
+                                            clip,
+                                        });
+                                    } else {
+                                        self.push_undo();
+                                        self.timeline_drag = Some(TimelineDrag::Move {
+                                            kind,
+                                            track,
+                                            clip,
+                                            grab_us: (t_for(p.x) - clip_time_start(
+                                                &self.project, kind, track, clip,
+                                            ))
+                                            .max(0),
+                                        });
+                                    }
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
 
-                // Drag-drop from the media panel: while dragging show a ghost,
-                // on release add the clip at the drop position/lane.
+                // --- Waveforms + clip labels + trim handles + selection frames ----
+                for (kind, track, clip, cr, _) in &clips {
+                    let (kind, track, clip, cr) = (*kind, *track, *clip, *cr);
+                    match kind {
+                        1 => {
+                            // Audio waveform scaled by source position.
+                            if let Some(c) = self
+                                .project
+                                .audio_tracks
+                                .get(track)
+                                .and_then(|tr| tr.clips.get(clip))
+                            {
+                                if self.settings.show_peaks {
+                                    if let Some(asset) = self.project.assets.get(c.asset) {
+                                        if !asset.peaks.is_empty() {
+                                            let n = asset.peaks.len();
+                                            let dur = asset.duration_us.max(1) as f32;
+                                            let mut px = cr.min.x;
+                                            let mid = cr.center().y;
+                                            while px < cr.max.x {
+                                                let local =
+                                                    (px - cr.min.x) / cr.width();
+                                                let src =
+                                                    c.source_at((local * c.on_timeline_us() as f32) as i64)
+                                                        as f32;
+                                                let bi = ((src / dur * n as f32) as usize).min(n - 1);
+                                                let (lo, hi) = asset.peaks[bi];
+                                                painter.line_segment(
+                                                    [
+                                                        egui::pos2(px, mid - hi * cr.height() * 0.5),
+                                                        egui::pos2(px, mid - lo * cr.height() * 0.5),
+                                                    ],
+                                                    egui::Stroke::new(1.0, WAVE),
+                                                );
+                                                px += 1.0;
+                                            }
+                                        }
+                                    }
+                                }
+                                painter.text(
+                                    cr.min + egui::vec2(3.0, 1.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &c_name(&self.project, c.asset),
+                                    egui::FontId::proportional(9.0),
+                                    Color32::from_rgb(235, 235, 240),
+                                );
+                            }
+                        }
+                        0 => {
+                            if let Some(c) = self
+                                .project
+                                .video_tracks
+                                .get(track)
+                                .and_then(|tr| tr.clips.get(clip))
+                            {
+                                painter.text(
+                                    cr.min + egui::vec2(3.0, 2.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &c_name(&self.project, c.asset),
+                                    egui::FontId::proportional(10.0),
+                                    WHITE,
+                                );
+                                // Speed badge.
+                                if (c.speed - 1.0).abs() > 0.001 {
+                                    painter.text(
+                                        cr.max - egui::vec2(3.0, 2.0),
+                                        egui::Align2::RIGHT_BOTTOM,
+                                        format!("{:.2}×", c.speed),
+                                        egui::FontId::proportional(9.0),
+                                        Color32::from_rgb(255, 220, 120),
+                                    );
+                                }
+                                if c.transition_us > 0 {
+                                    painter.text(
+                                        cr.min + egui::vec2(3.0, cr.height() - 13.0),
+                                        egui::Align2::LEFT_TOP,
+                                        "⊳",
+                                        egui::FontId::proportional(11.0),
+                                        Color32::from_rgb(150, 220, 255),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some(c) = self
+                                .project
+                                .text_tracks
+                                .get(track)
+                                .and_then(|tr| tr.clips.get(clip))
+                            {
+                                let label = c.text.replace('\n', " ").trim().to_string();
+                                painter.text(
+                                    cr.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &label,
+                                    egui::FontId::proportional(10.0),
+                                    Color32::from_rgb(245, 235, 200),
+                                );
+                            }
+                        }
+                    }
+                    // Trim handles.
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            cr.min,
+                            egui::vec2((cr.width() * 0.04).clamp(2.0, 7.0), cr.height()),
+                        ),
+                        2.0,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            egui::pos2(cr.max.x - (cr.width() * 0.04).clamp(2.0, 7.0), cr.min.y),
+                            egui::vec2((cr.width() * 0.04).clamp(2.0, 7.0), cr.height()),
+                        ),
+                        2.0,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+                    );
+
+                    // Selection indicators.
+                    let is_sel = matches!(
+                        self.selected,
+                        Selection::Video { track: t, clip: c }
+                            if t == track && c == clip
+                    ) || matches!(
+                        self.selected,
+                        Selection::Audio { track: t, clip: c }
+                            if t == track && c == clip
+                    ) || matches!(
+                        self.selected,
+                        Selection::Text { track: t, clip: c }
+                            if t == track && c == clip
+                    );
+                    let in_multi = self.multi_selection.iter().any(|m| {
+                        matches!(
+                            m,
+                            Selection::Video { track: t, clip: c }
+                                if *t == track && *c == clip
+                        ) || matches!(
+                            m,
+                            Selection::Audio { track: t, clip: c }
+                                if *t == track && *c == clip
+                        ) || matches!(
+                            m,
+                            Selection::Text { track: t, clip: c }
+                                if *t == track && *c == clip
+                        )
+                    });
+                    if is_sel || in_multi {
+                        painter.rect_stroke(
+                            cr,
+                            3.0,
+                            egui::Stroke::new(1.5, self.accent()),
+                            StrokeKind::Inside,
+                        );
+                    }
+                }
+
+                // --- Click handling (select, ruler seek) ---
+                if response.clicked() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        if p.x > content_min_x {
+                            let hit = clips
+                                .iter()
+                                .rev()
+                                .find(|(_, _, _, cr, _)| cr.contains(p));
+                            match hit {
+                                Some((kind, track, clip, _, _)) => {
+                                    let sel = match *kind {
+                                        0 => Selection::Video { track: *track, clip: *clip },
+                                        1 => Selection::Audio { track: *track, clip: *clip },
+                                        _ => Selection::Text { track: *track, clip: *clip },
+                                    };
+                                    let ctrl = ctx.input(|i| i.modifiers.ctrl);
+                                    if ctrl {
+                                        if self.multi_selection.iter().any(|m| {
+                                            std::mem::discriminant(m) == std::mem::discriminant(&sel)
+                                                && selection_equals(*m, sel)
+                                        }) {
+                                            self.multi_selection
+                                                .retain(|m| !selection_equals(*m, sel));
+                                        } else {
+                                            self.multi_selection.push(sel);
+                                        }
+                                        self.selected = sel;
+                                    } else {
+                                        self.multi_selection.clear();
+                                        self.selected = sel;
+                                    }
+                                }
+                                None => {
+                                    self.multi_selection.clear();
+                                    self.selected = Selection::None;
+                                    // Seek when clicking in the ruler band.
+                                    if p.y < rect.min.y + minimap_h + ruler_h {
+                                        self.playhead_us = t_for(p.x).clamp(0, dur_us);
+                                        self.seek_marker();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- Minimap (whole-project overview) ---
+                {
+                    let mm = Rect::from_min_max(
+                        egui::pos2(rect.min.x, rect.min.y),
+                        egui::pos2(rect.max.x, rect.min.y + minimap_h),
+                    );
+                    painter.rect_filled(mm, 2.0, Color32::from_rgb(16, 16, 20));
+                    for (kind, _ti, _ci, _cr, span) in &clips {
+                        let (s, d) = *span;
+                        let x0 = mm.min.x + s as f32 / dur_us as f32 * mm.width();
+                        let w = (d as f32 / dur_us as f32 * mm.width()).max(1.5);
+                        let col = match kind {
+                            0 => VIDEO_CLIP,
+                            1 => AUDIO_CLIP,
+                            _ => TEXT_CLIP,
+                        };
+                        painter.rect_filled(
+                            Rect::from_min_size(egui::pos2(x0, mm.min.y + 2.0), egui::vec2(w, mm.height() - 4.0)),
+                            1.0,
+                            col,
+                        );
+                    }
+                    // Viewport indicator.
+                    let vx0 = mm.min.x + self.timeline_scroll_us as f32 / dur_us as f32 * mm.width();
+                    let vw = (view_w / total_px.max(1.0) * mm.width()).min(mm.width());
+                    painter.rect_stroke(
+                        Rect::from_min_size(
+                            egui::pos2(vx0, mm.min.y),
+                            egui::vec2(vw, mm.height()),
+                        ),
+                        1.0,
+                        egui::Stroke::new(1.0, Color32::from_rgb(120, 130, 150)),
+                        StrokeKind::Inside,
+                    );
+                    // Click on minimap jumps.
+                    let mm_id = ui.id().with("minimap");
+                    let mm_r = ui.interact(mm, mm_id, Sense::click_and_drag());
+                    if mm_r.dragged() || mm_r.clicked() {
+                        if let Some(p) = mm_r.interact_pointer_pos() {
+                            let frac = ((p.x - mm.min.x) / mm.width()).clamp(0.0, 1.0);
+                            let target =
+                                (frac * dur_us as f32) as i64 - (view_w / px_per_sec) as i64 / 2;
+                            self.timeline_scroll_us =
+                                (target.max(0) as f32).min(max_scroll) as i64;
+                        }
+                    }
+                }
+
+                // --- Ruler, markers, loop region ---
+                {
+                    // Loop region shading on lanes area.
+                    if let (Some(ls), Some(le)) =
+                        (self.project.loop_start, self.project.loop_end)
+                    {
+                        if le > ls {
+                            let lx0 = x_for(ls).max(content_min_x);
+                            let lx1 = x_for(le).min(rect.max.x);
+                            if lx1 > lx0 {
+                                painter.rect_filled(
+                                    Rect::from_min_max(
+                                        egui::pos2(lx0, rect.min.y + minimap_h),
+                                        egui::pos2(lx1, rect.max.y),
+                                    ),
+                                    0.0,
+                                    Color32::from_rgba_unmultiplied(120, 190, 255, 12),
+                                );
+                            }
+                        }
+                    }
+                    // Ruler ticks.
+                    let ruler_y = rect.min.y + minimap_h;
+                    let major_us = {
+                        // Choose a nice tick interval.
+                        let sec = px_per_sec;
+                        let mut candidates = [0.25f64, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0];
+                        candidates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let mut pick = 10.0;
+                        for c in candidates {
+                            if c as f32 * sec >= 70.0 {
+                                pick = c;
+                                break;
+                            }
+                        }
+                        (pick * SECOND_US as f64) as i64
+                    };
+                    let t0 = t_for(rect.min.x - 1.0).max(0);
+                    let t1 = t_for(rect.max.x);
+                    let mut tick = (t0 / major_us) * major_us;
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            egui::pos2(rect.min.x, ruler_y),
+                            egui::pos2(rect.max.x, ruler_y + ruler_h),
+                        ),
+                        0.0,
+                        Color32::from_rgb(13, 13, 16),
+                    );
+                    while tick <= t1 {
+                        let tx = x_for(tick);
+                        if tx >= content_min_x {
+                            painter.line_segment(
+                                [
+                                    egui::pos2(tx, ruler_y),
+                                    egui::pos2(tx, ruler_y + 6.0),
+                                ],
+                                egui::Stroke::new(1.0, Color32::from_rgb(150, 150, 160)),
+                            );
+                            painter.text(
+                                egui::pos2(tx + 2.0, ruler_y + 2.0),
+                                egui::Align2::LEFT_TOP,
+                                timecode_string(tick, self.project.fps),
+                                egui::FontId::proportional(9.0),
+                                Color32::from_rgb(150, 150, 160),
+                            );
+                        }
+                        tick += major_us;
+                    }
+                    // Loop endpoints.
+                    if let (Some(ls), Some(le)) =
+                        (self.project.loop_start, self.project.loop_end)
+                    {
+                        if le > ls {
+                            for (t, l) in [(ls, "◫"), (le, "◭")] {
+                                let lx = x_for(t).clamp(content_min_x, rect.max.x);
+                                painter.text(
+                                    egui::pos2(lx, ruler_y + ruler_h - 4.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    l,
+                                    egui::FontId::proportional(10.0),
+                                    Color32::from_rgb(120, 190, 255),
+                                );
+                            }
+                        }
+                    }
+                    // Markers.
+                    for m in &self.project.markers {
+                        let mx = x_for(m.time_us);
+                        if mx < content_min_x - 6.0 || mx > rect.max.x {
+                            continue;
+                        }
+                        let col = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                egui::pos2(mx, ruler_y + ruler_h - 9.0),
+                                egui::pos2(mx - 4.0, ruler_y + ruler_h),
+                                egui::pos2(mx + 4.0, ruler_y + ruler_h),
+                            ],
+                            col,
+                            egui::Stroke::NONE,
+                        ));
+                        if !m.name.is_empty() {
+                            painter.text(
+                                egui::pos2(mx + 5.0, ruler_y + ruler_h - 9.0),
+                                egui::Align2::LEFT_TOP,
+                                &m.name,
+                                egui::FontId::proportional(9.0),
+                                col,
+                            );
+                        }
+                    }
+                }
+
+                // --- Playhead ---
+                let px = x_for(self.playhead_us).clamp(content_min_x, rect.max.x);
+                painter.line_segment(
+                    [egui::pos2(px, rect.min.y + minimap_h + ruler_h), egui::pos2(px, rect.max.y)],
+                    egui::Stroke::new(2.0, PLAYHEAD),
+                );
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(px, rect.min.y + minimap_h),
+                        egui::pos2(px - 5.0, rect.min.y + minimap_h + 7.0),
+                        egui::pos2(px + 5.0, rect.min.y + minimap_h + 7.0),
+                    ],
+                    PLAYHEAD,
+                    egui::Stroke::NONE,
+                ));
+
+                // --- Empty state hint ---
+                if clips.is_empty() {
+                    painter.text(
+                        egui::pos2(rect.center().x, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        "Import media or drag clips here (Ctrl+K for commands)",
+                        egui::FontId::proportional(12.0),
+                        Color32::from_rgb(120, 120, 132),
+                    );
+                }
+
+                // --- Drag-drop from the media panel ---
                 if let Some(src) = self.drag_source {
                     let dragging = ctx.input(|i| i.pointer.primary_down());
                     if dragging {
                         if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
                             if rect.contains(p) {
-                                let frac = ((p.x - rect.min.x) / w).clamp(0.0, 1.0);
-                                let drop_us = (usize_dur as f64 * frac as f64) as i64;
+                                let drop_us = t_for(p.x).max(0);
                                 self.drag_timeline_us = Some(drop_us);
-                                // Ghost.
-                                let gx = rect.min.x + frac * w;
+                                let gx = x_for(drop_us);
                                 painter.line_segment(
-                                    [
-                                        egui::pos2(gx, rect.min.y),
-                                        egui::pos2(gx, rect.max.y),
-                                    ],
-                                    egui::Stroke::new(1.0, ACCENT),
+                                    [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                                    egui::Stroke::new(1.0, self.accent()),
                                 );
+                                if let Some((_kind, _idx, lane)) =
+                                    lane_rects.iter().find(|(_, _, l)| l.contains(p))
+                                {
+                                    painter.rect_stroke(
+                                        *lane,
+                                        0.0,
+                                        egui::Stroke::new(1.0, self.accent()),
+                                        StrokeKind::Inside,
+                                    );
+                                }
                             }
                         }
                     }
                     if ctx.input(|i| i.pointer.any_released()) {
                         let mut drop_us =
                             self.drag_timeline_us.unwrap_or(self.project.duration_us());
-                        // Snap to the playhead when close (150ms window).
                         if self.settings.snap_to_playhead
                             && (drop_us - self.playhead_us).abs() < 150_000
                         {
@@ -1725,7 +2995,6 @@ impl FastCutterApp {
                         }
                         if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
                             if rect.contains(p) {
-                                // Find lane under the pointer.
                                 let mut target: Option<(u8, usize)> = None;
                                 for (kind, idx, lane) in &lane_rects {
                                     if lane.contains(p) {
@@ -1735,7 +3004,11 @@ impl FastCutterApp {
                                 }
                                 if let Some((kind, idx)) = target {
                                     self.push_undo();
-                                    self.add_clip_at(src, kind, idx, drop_us);
+                                    if kind == 2 {
+                                        self.add_text_asset_drop(&src, idx, drop_us);
+                                    } else {
+                                        self.add_clip_at(src, kind, idx, drop_us);
+                                    }
                                 }
                             }
                         }
@@ -1744,6 +3017,63 @@ impl FastCutterApp {
                     }
                 }
             });
+    }
+
+    /// New empty text clip dropped onto a text lane.
+    fn add_text_asset_drop(&mut self, _src: &AssetId, _track: usize, _time: i64) {
+        self.add_text_clip_at(_track, _time);
+    }
+
+    fn add_text_clip_at(&mut self, track: usize, time: i64) {
+        let idx = track.min(self.project.text_tracks.len().saturating_sub(1));
+        self.project.text_tracks[idx].clips.push(TextClip {
+            text: "New text".into(),
+            timeline_start: time.max(0),
+            timeline_end: time.max(0) + 3 * SECOND_US,
+            ..TextClip::default()
+        });
+    }
+
+    /// Snap a proposed clip start time to the playhead, marker, or a nearby
+    /// clip edge (within ~8px worth of time).
+    fn snapped_time(&self, t: i64) -> i64 {
+        if !self.settings.snap_to_playhead {
+            return t;
+        }
+        let window = (self.timeline_zoom.max(4.0).recip() * SECOND_US as f32 * 9.0) as i64;
+        let mut best = t;
+        let mut best_d = window + 1;
+        let mut candidates: Vec<i64> = Vec::new();
+        candidates.push(self.playhead_us);
+        for m in &self.project.markers {
+            candidates.push(m.time_us);
+        }
+        for tr in &self.project.video_tracks {
+            for c in &tr.clips {
+                candidates.push(c.timeline_start);
+                candidates.push(c.timeline_start + c.on_timeline_us());
+            }
+        }
+        for tr in &self.project.audio_tracks {
+            for c in &tr.clips {
+                candidates.push(c.timeline_start);
+                candidates.push(c.timeline_start + c.on_timeline_us());
+            }
+        }
+        for tr in &self.project.text_tracks {
+            for c in &tr.clips {
+                candidates.push(c.timeline_start);
+                candidates.push(c.timeline_end);
+            }
+        }
+        for cand in candidates {
+            let d = (cand - t).abs();
+            if d <= window && d < best_d {
+                best = cand;
+                best_d = d;
+            }
+        }
+        best
     }
 
     // ── Import / asset helpers ───────────────────────────────────────────────
@@ -2654,6 +3984,8 @@ fn shortcut_label(sc: KeyboardShortcut) -> String {
 const WHITE: Color32 = Color32::from_rgb(236, 236, 240);
 const PANEL: Color32 = Color32::from_rgb(12, 12, 14);
 const TRACK: Color32 = Color32::from_rgb(18, 18, 22);
+const GRAY: Color32 = Color32::from_rgb(170, 174, 182);
+const DIM: Color32 = Color32::from_rgb(110, 114, 122);
 const BUTTON: Color32 = Color32::from_rgb(32, 32, 38);
 const ACCENT: Color32 = Color32::from_rgb(60, 120, 210);
 const VIDEO_CLIP: Color32 = Color32::from_rgb(40, 70, 120);
