@@ -34,7 +34,16 @@ jobs:
         shell: pwsh
         run: |
           vcpkg install ffmpeg:x64-windows
-          echo "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # The runner image may not set VCPKG_ROOT; derive it from the vcpkg
+          # binary on PATH (ffmpeg-sys-next's vcpkg probe requires this env var).
+          if ($env:VCPKG_ROOT -and (Test-Path $env:VCPKG_ROOT\.vcpkg-root)) {
+            $vcpkgRoot = $env:VCPKG_ROOT
+          } elseif (Test-Path C:\vcpkg\.vcpkg-root) {
+            $vcpkgRoot = "C:\vcpkg"
+          } else {
+            $vcpkgRoot = Split-Path -Parent (Get-Command vcpkg).Source
+          }
+          echo "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Resolve version
         id: version
