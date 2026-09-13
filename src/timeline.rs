@@ -122,6 +122,24 @@ pub struct VideoClip {
     pub timeline_start: Timecode,
     pub opacity: f32,
     pub transform: Transform,
+    #[serde(default)]
+    pub speed: f32,
+    #[serde(default)]
+    pub blend: BlendMode,
+    #[serde(default)]
+    pub grade: ColorGrade,
+    #[serde(default)]
+    pub flip_x: bool,
+    #[serde(default)]
+    pub flip_y: bool,
+    /// Normalized visible region `[left, top, right, bottom]`.
+    #[serde(default)]
+    pub crop: [f32; 4],
+    /// Crossfade/dissolve duration with the previous clip on the same track.
+    #[serde(default)]
+    pub transition_us: Timecode,
+    #[serde(default)]
+    pub keyframes: Vec<TransformKeyframe>,
 }
 
 impl Default for VideoClip {
@@ -133,7 +151,31 @@ impl Default for VideoClip {
             timeline_start: 0,
             opacity: 1.0,
             transform: Transform::default(),
+            speed: 1.0,
+            blend: BlendMode::Normal,
+            grade: ColorGrade::default(),
+            flip_x: false,
+            flip_y: false,
+            crop: [0.0, 0.0, 1.0, 1.0],
+            transition_us: 0,
+            keyframes: Vec::new(),
         }
+    }
+}
+
+/// Length of this clip on the timeline, respecting speed changes.
+impl VideoClip {
+    pub fn on_timeline_us(&self) -> Timecode {
+        let d = self.source_out.saturating_sub(self.source_in);
+        if self.speed > 0.0 {
+            (d as f64 / self.speed as f64).round() as Timecode
+        } else {
+            d
+        }
+    }
+    /// Source time (µs) for a given local timeline offset within the clip.
+    pub fn source_at(&self, local_us: Timecode) -> Timecode {
+        self.source_in + ((local_us as f64 * self.speed as f64) as Timecode)
     }
 }
 
@@ -146,6 +188,18 @@ pub struct AudioClip {
     pub gain_db: f32,
     pub fade_in_us: Timecode,
     pub fade_out_us: Timecode,
+    #[serde(default = "default_speed")]
+    pub speed: f32,
+    /// Gain envelope keyframes `(time_us relative to clip, linear gain)`.
+    #[serde(default)]
+    pub envelope: Vec<(Timecode, f32)>,
+    /// Per-clip mute/automation bypass flag (filmstrip placeholder).
+    #[serde(default)]
+    pub solo: bool,
+}
+
+fn default_speed() -> f32 {
+    1.0
 }
 
 impl Default for AudioClip {
@@ -158,7 +212,48 @@ impl Default for AudioClip {
             gain_db: 0.0,
             fade_in_us: 0,
             fade_out_us: 0,
+            speed: 1.0,
+            envelope: Vec::new(),
+            solo: false,
         }
+    }
+}
+
+impl AudioClip {
+    pub fn on_timeline_us(&self) -> Timecode {
+        let d = self.source_out.saturating_sub(self.source_in);
+        if self.speed > 0.0 {
+            (d as f64 / self.speed as f64).round() as Timecode
+        } else {
+            d
+        }
+    }
+    pub fn source_at(&self, local_us: Timecode) -> Timecode {
+        self.source_in + ((local_us as f64 * self.speed as f64) as Timecode)
+    }
+    /// Envelope gain at local time plus the base gain_db converted to linear.
+    pub fn gain_linear_at(&self, local_us: Timecode) -> f32 {
+        let mut g = 1.0f32;
+        if self.envelope.len() == 1 {
+            g = self.envelope[0].1;
+        } else if self.envelope.len() > 1 {
+            let t = local_us as f32;
+            for w in self.envelope.windows(2) {
+                let (t0, g0) = w[0];
+                let (t1, g1) = w[1];
+                if t >= t0 as f32 && t <= t1 as f32 {
+                    let denom = (t1 - t0).max(1) as f32;
+                    let f = ((t - t0 as f32) / denom).clamp(0.0, 1.0);
+                    g = g0 + (g1 - g0) * f;
+                    break;
+                }
+                if t < t0 as f32 {
+                    g = g0;
+                    break;
+                }
+            }
+        }
+        g
     }
 }
 
@@ -167,6 +262,65 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Add,
+    Overlay,
+}
+
+impl Default for BlendMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+/// Per-pixel color grade applied to a clip's source before compositing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorGrade {
+    pub brightness: f32, // -1..1
+    pub contrast: f32,   // 0..3 (1 = neutral)
+    pub saturation: f32, // 0..3 (1 = neutral)
+    pub hue_shift: f32,  // radians
+}
+
+impl Default for ColorGrade {
+    fn default() -> Self {
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            hue_shift: 0.0,
+        }
+    }
+}
+
+/// Animated transform: keyframe at `t_us` relative to the clip's timeline start.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TransformKeyframe {
+    pub t_us: Timecode,
+    pub transform: Transform,
+}
+
+impl Default for TransformKeyframe {
+    fn default() -> Self {
+        Self {
+            t_us: 0,
+            transform: Transform::default(),
+        }
+    }
+}
+
+/// A user marker placed on the timeline ruler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub time_us: Timecode,
+    pub name: String,
+    pub color: [u8; 3],
 }
 
 fn default_font_family() -> String {
@@ -181,6 +335,23 @@ pub struct TextStyle {
     #[serde(default = "default_text_color")]
     pub color: [u8; 4],
     pub align: TextAlign,
+    #[serde(default)]
+    pub outline_color: [u8; 4],
+    #[serde(default)]
+    pub outline_width: f32,
+    #[serde(default)]
+    pub shadow: bool,
+    /// Background box RGBA; alpha 0 disables it.
+    #[serde(default)]
+    pub background: [u8; 4],
+    #[serde(default)]
+    pub box_padding: f32,
+    /// Max line width in px (0 = no wrapping).
+    #[serde(default)]
+    pub word_wrap: f32,
+    /// Typewriter reveal: text appears progressively over the clip.
+    #[serde(default)]
+    pub typewriter: bool,
 }
 
 fn default_text_color() -> [u8; 4] {
@@ -194,6 +365,13 @@ impl Default for TextStyle {
             font_family: default_font_family(),
             color: [236, 236, 240, 255],
             align: TextAlign::Center,
+            outline_color: [0, 0, 0, 0],
+            outline_width: 0.0,
+            shadow: true,
+            background: [0, 0, 0, 0],
+            box_padding: 8.0,
+            word_wrap: 0.0,
+            typewriter: false,
         }
     }
 }
@@ -237,6 +415,10 @@ pub struct Track<T> {
     pub muted: bool,
     pub locked: bool,
     pub name: String,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub color: [u8; 3],
 }
 
 /// A whole editing project.
@@ -251,7 +433,26 @@ pub struct Project {
     pub sample_rate: u32,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub loop_start: Option<Timecode>,
+    #[serde(default)]
+    pub loop_end: Option<Timecode>,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+    #[serde(default)]
+    pub ripple: bool,
 }
+
+const TRACK_COLORS: [[u8; 3]; 8] = [
+    [70, 120, 210],
+    [120, 200, 120],
+    [230, 160, 70],
+    [200, 110, 200],
+    [80, 200, 220],
+    [210, 90, 90],
+    [160, 200, 90],
+    [150, 120, 220],
+];
 
 impl Project {
     pub fn new() -> Self {
@@ -388,8 +589,7 @@ mod tests {
             source_in: 0,
             source_out: 5 * SECOND_US,
             timeline_start: 1 * SECOND_US,
-            opacity: 1.0,
-            transform: Transform::default(),
+            ..VideoClip::default()
         });
         let json = serde_json::to_string(&p).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();

@@ -218,6 +218,8 @@ pub struct FastCutterApp {
     export_h: u32,
     export_fps: f64,
     export_msg: Option<String>,
+    /// Source fps awaiting user confirmation to adopt as the project fps.
+    pending_fps: Option<f64>,
     toasts: Vec<(String, Instant)>,
     // Undo / redo stacks
     undo_stack: Vec<Project>,
@@ -271,6 +273,7 @@ impl FastCutterApp {
             export_fps: 30.0,
             export_msg: None,
             toasts: Vec::new(),
+            pending_fps: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -587,6 +590,7 @@ impl eframe::App for FastCutterApp {
         if self.settings_open {
             self.settings_window(ctx);
         }
+        self.fps_prompt_window(ctx);
         self.toast_overlay(ctx);
 
         // Clear a pending media drag when the pointer was released.
@@ -1342,11 +1346,14 @@ impl FastCutterApp {
         let path_s = path.to_string_lossy().into_owned();
         match crate::assets::import_media(&mut self.project.assets, &path_s) {
             Ok(id) => {
-                // Auto-adjust the project frame rate to the source video.
+                // If the source is a video with a different frame rate, ask
+                // whether to adopt it as the project fps (dialog, not silent).
                 let mut tag = String::new();
                 if let Some(a) = self.project.assets.get(id) {
                     if a.kind == AssetKind::Video && a.frame_rate > 0.0 {
-                        self.project.fps = a.frame_rate;
+                        if (a.frame_rate - self.project.fps).abs() > 0.001 {
+                            self.pending_fps = Some(a.frame_rate);
+                        }
                         tag = format!(" at {:.2} fps", a.frame_rate);
                     }
                 }
@@ -1420,8 +1427,7 @@ impl FastCutterApp {
                             source_in: 0,
                             source_out: 3 * SECOND_US,
                             timeline_start: time_us,
-                            opacity: 1.0,
-                            transform: Transform::default(),
+                            ..VideoClip::default()
                         });
                     }
                     _ => {
@@ -1430,8 +1436,7 @@ impl FastCutterApp {
                             source_in: 0,
                             source_out: dur,
                             timeline_start: time_us,
-                            opacity: 1.0,
-                            transform: Transform::default(),
+                            ..VideoClip::default()
                         });
                     }
                 }
@@ -1443,9 +1448,9 @@ impl FastCutterApp {
                     source_in: 0,
                     source_out: dur,
                     timeline_start: time_us,
-                    gain_db: 0.0,
                     fade_in_us: 200_000,
                     fade_out_us: 200_000,
+                    ..AudioClip::default()
                 });
             }
             _ => {}
@@ -1683,8 +1688,7 @@ impl FastCutterApp {
                 source_in: src,
                 source_out: c.source_out,
                 timeline_start: pt,
-                opacity: c.opacity,
-                transform: c.transform,
+                ..c.clone()
             },
         );
     }
@@ -1710,9 +1714,7 @@ impl FastCutterApp {
                 source_in: src,
                 source_out: c.source_out,
                 timeline_start: pt,
-                gain_db: c.gain_db,
-                fade_in_us: c.fade_in_us,
-                fade_out_us: c.fade_out_us,
+                ..c.clone()
             },
         );
         self.audio.refresh(&self.project);
@@ -1869,6 +1871,49 @@ impl FastCutterApp {
             ));
         }
         self.settings_open = open && !request_close;
+    }
+
+    // ── Frame rate adjustment dialog ─────────────────────────────────────────
+    fn fps_prompt_window(&mut self, ctx: &egui::Context) {
+        let Some(fps) = self.pending_fps else { return };
+        let mut open = true;
+        let mut decided = false;
+        egui::Window::new("Adjust frame rate?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "The imported video runs at {:.2} fps.\nAdjust the project to \
+                     match ({:.2} fps)?",
+                    fps, fps
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let yes = egui::Button::new(format!("Yes · {:.2} fps", fps))
+                        .fill(ui.visuals().selection.bg_fill);
+                    if ui.add(yes).clicked() {
+                        self.project.fps = fps;
+                        self.toasts.push((
+                            format!("Project frame rate set to {:.2} fps", fps),
+                            Instant::now(),
+                        ));
+                        decided = true;
+                    }
+                    if ui.button("No").clicked() {
+                        self.toasts.push((
+                            "Kept current project frame rate".into(),
+                            Instant::now(),
+                        ));
+                        decided = true;
+                    }
+                });
+            });
+        // Closing via X behaves like "No".
+        if decided || !open {
+            self.pending_fps = None;
+        }
     }
 
     // ── Toast overlay (top-right, auto-fading) ──────────────────────────────
