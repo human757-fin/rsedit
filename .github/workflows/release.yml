@@ -108,7 +108,7 @@ jobs:
             libxkbcommon-dev libwayland-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libavfilter-dev libswresample-dev \
-            libasound2-dev clang
+            libasound2-dev clang libavdevice-dev
 
       - uses: Swatinem/rust-cache@v2
 
@@ -251,7 +251,7 @@ jobs:
 
             ```sh
             # Ubuntu/Debian: install runtime libs
-            sudo apt install libavcodec61 libavformat61 libswscale8 libavfilter10 libswresample5
+            sudo apt install libavcodec61 libavformat61 libswscale8 libavfilter10 libswresample5 libavdevice61
             tar -xzf rsedit-*-linux-x86_64.tar.gz
             ./rsedit-*/rsedit
             ```
