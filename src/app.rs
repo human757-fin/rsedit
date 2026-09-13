@@ -1,24 +1,79 @@
 //! Fast Cutter — the editor application itself.
 //!
-//! Layout: top transport bar, left media panel, center preview viewport,
-//! right clip inspector, bottom multi-track timeline. Theme is near-black
-//! (#08080a) with near-white foreground, per the design brief.
+//! Layout: top menu bar + transport bar, left media panel (tabbed, with
+//! drag-and-drop), center preview viewport, right clip inspector, bottom
+//! multi-track timeline. Theme is near-black (#08080a) with near-white
+//! foreground.
 
 use std::path::PathBuf;
 
 use eframe::egui;
-use egui::{Color32, RichText};
+use egui::{Color32, Key, KeyboardShortcut, Modifiers, Rect, RichText, Sense, StrokeKind};
 
-use crate::audio::{AudioEngine, timecode_string};
+use crate::audio::{timecode_string, AudioEngine};
 use crate::decoder::ensure_ffmpeg;
 use crate::framecache::{FrameCache, FrameRequest};
 use crate::timeline::{
-    AssetId, AssetKind, AudioClip, Project, TextAlign, TextClip, TextStyle, Timecode, Transform,
-    VideoClip, SECOND_US,
+    AssetId, AssetKind, AudioClip, Project, TextAlign, TextClip, TextStyle, Timecode, Track,
+    Transform, VideoClip, SECOND_US,
 };
 
 const PREVIEW_W: u32 = 1280;
 const PREVIEW_H: u32 = 720;
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct Keybinds {
+    play_pause: KeyboardShortcut,
+    step_fwd: KeyboardShortcut,
+    step_back: KeyboardShortcut,
+    jump_start: KeyboardShortcut,
+    jump_end: KeyboardShortcut,
+    split_clip: KeyboardShortcut,
+    delete_clip: KeyboardShortcut,
+    undo: KeyboardShortcut,
+    redo: KeyboardShortcut,
+    export_render: KeyboardShortcut,
+    add_text: KeyboardShortcut,
+    toggle_peaks: KeyboardShortcut,
+    add_video_track: KeyboardShortcut,
+    add_audio_track: KeyboardShortcut,
+    close_window: KeyboardShortcut,
+}
+
+impl Default for Keybinds {
+    fn default() -> Self {
+        Self {
+            play_pause: KeyboardShortcut::new(Modifiers::NONE, Key::Space),
+            step_fwd: KeyboardShortcut::new(Modifiers::NONE, Key::ArrowRight),
+            step_back: KeyboardShortcut::new(Modifiers::NONE, Key::ArrowLeft),
+            jump_start: KeyboardShortcut::new(Modifiers::NONE, Key::Home),
+            jump_end: KeyboardShortcut::new(Modifiers::NONE, Key::End),
+            split_clip: KeyboardShortcut::new(Modifiers::CTRL, Key::S),
+            delete_clip: KeyboardShortcut::new(Modifiers::NONE, Key::Delete),
+            undo: KeyboardShortcut::new(Modifiers::CTRL, Key::Z),
+            redo: KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z),
+            export_render: KeyboardShortcut::new(Modifiers::CTRL, Key::E),
+            add_text: KeyboardShortcut::new(Modifiers::CTRL, Key::T),
+            toggle_peaks: KeyboardShortcut::new(Modifiers::NONE, Key::P),
+            add_video_track: KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::V),
+            add_audio_track: KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::A),
+            close_window: KeyboardShortcut::new(Modifiers::NONE, Key::Escape),
+        }
+    }
+}
+
+// ── Media panel tab ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaTab {
+    All,
+    Video,
+    Audio,
+}
+
+// ── Application state ────────────────────────────────────────────────────────
 
 pub struct FastCutterApp {
     project: Project,
@@ -30,6 +85,13 @@ pub struct FastCutterApp {
     preview_texture: Option<egui::TextureHandle>,
     preview_rendered_pts: Option<i64>,
     selected: Selection,
+    // UI state
+    media_tab: MediaTab,
+    drag_source: Option<AssetId>,
+    drag_timeline_us: Option<i64>,
+    keybinds_open: bool,
+    keybinds: Keybinds,
+    // Export dialog
     export_open: bool,
     export_path: String,
     export_w: u32,
@@ -38,9 +100,12 @@ pub struct FastCutterApp {
     export_msg: Option<String>,
     show_peaks: bool,
     toasts: Vec<String>,
+    // Undo / redo stacks
+    undo_stack: Vec<Project>,
+    redo_stack: Vec<Project>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
     None,
     Video { track: usize, clip: usize },
@@ -71,6 +136,11 @@ impl FastCutterApp {
             preview_texture: None,
             preview_rendered_pts: None,
             selected: Selection::None,
+            media_tab: MediaTab::All,
+            drag_source: None,
+            drag_timeline_us: None,
+            keybinds_open: false,
+            keybinds: Keybinds::default(),
             export_open: false,
             export_path: "out.mp4".into(),
             export_w: 1920,
@@ -79,6 +149,34 @@ impl FastCutterApp {
             export_msg: None,
             show_peaks: true,
             toasts: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.project.clone());
+        self.redo_stack.clear();
+        if self.undo_stack.len() > 100 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.project.clone());
+            self.project = prev;
+            self.audio.refresh(&self.project);
+            self.last_request = None;
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.project.clone());
+            self.project = next;
+            self.audio.refresh(&self.project);
+            self.last_request = None;
         }
     }
 
@@ -95,16 +193,16 @@ impl FastCutterApp {
                 h,
             }
             .render_at(pts);
-            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            let img =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             tex.set(img, egui::TextureOptions::LINEAR);
         }
         self.preview_rendered_pts = Some(pts);
     }
 
     fn request_frame(&mut self) {
-        // Ask the decoder for the asset under the playhead (topmost video clip).
         let pts = self.playhead_us;
-        if let Some((ti, clip)) = top_video_clip(&self.project, pts) {
+        if let Some((_ti, clip)) = top_video_clip(&self.project, pts) {
             if let Some(asset) = self.project.assets.get(clip.asset) {
                 if asset.kind == AssetKind::Image {
                     return;
@@ -119,112 +217,50 @@ impl FastCutterApp {
                         pts_us: pts,
                     });
                     self.last_request = Some(key);
-                    let _ = ti;
                 }
             }
         }
     }
-}
 
-fn top_video_clip(p: &Project, t: Timecode) -> Option<(usize, &VideoClip)> {
-    p.video_tracks.iter().enumerate().rev().find_map(|(ti, tr)| {
-        tr.clips
-            .iter()
-            .find(|c| c.timeline_start <= t && t < c.timeline_start + (c.source_out - c.source_in))
-            .map(|c| (ti, c))
-    })
-}
-
-impl eframe::App for FastCutterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Transport clock driven by audio engine when playing.
-        if self.playing {
-            let pos = self.audio.pos_us();
-            if pos > self.playhead_us as f64 {
-                self.playhead_us = pos as i64;
-            }
-            if self.playhead_us > self.project.duration_us().max(SECOND_US) {
-                self.playhead_us = 0;
-                self.audio.set_pos_us(0.0);
-                self.playing = false;
-                self.audio.pause();
-            }
-        }
-
-        self.request_frame();
-        if self.preview_texture.is_none() {
-            let size = [PREVIEW_W as usize, PREVIEW_H as usize];
-            let s = ctx.load_texture(
-                "preview",
-                egui::ColorImage::new(size, Color32::from_rgb(8, 8, 10)),
-                egui::TextureOptions::LINEAR,
-            );
-            self.preview_texture = Some(s);
-        }
-        if self.preview_rendered_pts != Some(self.playhead_us.min(self.project.duration_us().max(SECOND_US))) {
-            self.compute_preview();
-        }
-
-        self.top_bar(ctx);
-        self.media_panel(ctx);
-        self.inspector(ctx);
-        self.timeline(ctx);
-        if self.export_open {
-            self.export_window(ctx);
-        }
-        self.status_bar(ctx);
-        ctx.request_repaint();
+    fn step_frame(&mut self, delta: i64) {
+        let us_per_frame = (SECOND_US as f64 / self.project.fps) as i64;
+        self.playhead_us = (self.playhead_us + delta * us_per_frame)
+            .max(0)
+            .min(self.project.duration_us().max(SECOND_US));
+        self.seek_marker();
     }
-}
 
-impl FastCutterApp {
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("transport").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("◆ Fast Cutter").color(WHITE));
-                ui.separator();
-                let play = if self.playing {
-                    RichText::new("⏸").color(WHITE)
+    fn delete_selected(&mut self) {
+        let sel = match self.selected {
+            Selection::None => return,
+            other => other,
+        };
+        let (kind, track, clip) = match sel {
+            Selection::Video { track, clip } => (0u8, track, clip),
+            Selection::Audio { track, clip } => (1u8, track, clip),
+            Selection::Text { track, clip } => (2u8, track, clip),
+            Selection::None => return,
+        };
+        let len = match kind {
+            0 => self.project.video_tracks.get(track).map(|t| t.clips.len()),
+            1 => self.project.audio_tracks.get(track).map(|t| t.clips.len()),
+            _ => self.project.text_tracks.get(track).map(|t| t.clips.len()),
+        };
+        if let Some(len) = len {
+            if clip < len {
+                self.push_undo();
+                if kind == 0 {
+                    self.project.video_tracks[track].clips.remove(clip);
+                } else if kind == 1 {
+                    self.project.audio_tracks[track].clips.remove(clip);
                 } else {
-                    RichText::new("▶").color(WHITE)
-                };
-                if ui
-                    .add_sized([40.0, 28.0], egui::Button::new(play).fill(BUTTON))
-                    .on_hover_text("Space")
-                    .clicked()
-                {
-                    self.toggle_play();
+                    self.project.text_tracks[track].clips.remove(clip);
                 }
-                if ui
-                    .add_sized([44.0, 28.0], egui::Button::new("⏮").fill(BUTTON))
-                    .clicked()
-                {
-                    self.playhead_us = 0;
-                    self.seek_marker();
-                }
-                if ui
-                    .add_sized([44.0, 28.0], egui::Button::new("⏭").fill(BUTTON))
-                    .clicked()
-                {
-                    self.playhead_us = self.project.duration_us().max(SECOND_US);
-                    self.seek_marker();
-                }
-                ui.label(format!(
-                    "{} / {}",
-                    timecode_string(self.playhead_us, self.project.fps),
-                    timecode_string(self.project.duration_us(), self.project.fps)
-                ));
-                ui.separator();
-                if ui
-                    .add_sized([64.0, 28.0], egui::Button::new("Export").fill(ACCENT))
-                    .clicked()
-                {
-                    self.export_open = true;
-                }
-            });
-            ui.add_space(4.0);
-        });
+                self.selected = Selection::None;
+            }
+        }
+        self.audio.refresh(&self.project);
+        self.last_request = None;
     }
 
     fn toggle_play(&mut self) {
@@ -244,407 +280,559 @@ impl FastCutterApp {
         self.last_request = None;
     }
 
-    fn media_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("media")
-            .resizable(true)
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.strong("Media");
-                    ui.separator();
-                    if ui
-                        .add_sized([56.0, 22.0], egui::Button::new("＋ Import").fill(ACCENT))
-                        .clicked()
-                    {
-                        let path = rfd::FileDialog::new()
-                            .set_title("Import media")
-                            .add_filter(
-                                "Media",
-                                &["mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "aac", "flac", "ogg", "png", "jpg", "jpeg", "webp"],
-                            )
-                            .pick_file();
-                        if let Some(p) = path {
-                            self.import_media(p);
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-
-                let mut remove_id: Option<AssetId> = None;
-                let mut add_id: Option<AssetId> = None;
-                let ids: Vec<AssetId> = self.project.assets.assets.keys().copied().collect();
-                let fps = self.project.fps;
-                egui::ScrollArea::vertical().max_height(ui.available_height()).show(ui, |ui| {
-                    for id in ids {
-                        let Some(a) = self.project.assets.get(id) else { continue };
-                        let kind = match a.kind {
-                            AssetKind::Video => "🎬",
-                            AssetKind::Audio => "🎵",
-                            AssetKind::Image => "🖼",
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "{kind} {}  [{:?}]",
-                                a.name,
-                                timecode_string(a.duration_us, fps)
-                            ));
-                            if ui.small_button("➤").clicked() {
-                                add_id = Some(id);
-                            }
-                            if ui.small_button("×").clicked() {
-                                remove_id = Some(id);
-                            }
-                        });
-                    }
-                });
-                if let Some(id) = add_id {
-                    self.add_clip_from_media(id);
-                }
-                if let Some(id) = remove_id {
-                    self.remove_asset(id);
-                }
-                ui.separator();
-                ui.checkbox(&mut self.show_peaks, "Show audio peaks");
-            });
-    }
-
-    fn import_media(&mut self, path: PathBuf) {
-        let path_s = path.to_string_lossy().into_owned();
-        match crate::assets::import_media(&mut self.project.assets, &path_s) {
-            Ok(id) => {
-                self.audio.refresh(&self.project);
-                self.toasts.push(format!("Imported {}", self.project.assets.get(id).map(|a| a.name.clone()).unwrap_or_default()));
-            }
-            Err(e) => self.toasts.push(format!("Import failed: {e}")),
-        }
-    }
-
-    fn remove_asset(&mut self, id: AssetId) {
-        // Only drop assets no longer referenced by any clip.
-        let used_video = self
-            .project
-            .video_tracks
-            .iter()
-            .any(|t| t.clips.iter().any(|c| c.asset == id));
-        let used_audio = self
-            .project
-            .audio_tracks
-            .iter()
-            .any(|t| t.clips.iter().any(|c| c.asset == id));
-        if used_video || used_audio {
-            self.toasts.push("Remove clips first".into());
-            return;
-        }
-        self.project.assets.assets.remove(&id);
-        self.audio.refresh(&self.project);
-    }
-
-    fn add_clip_from_media(&mut self, id: AssetId) {
-        let Some(asset) = self.project.assets.get(id).cloned() else { return };
-        let start = self.project.duration_us();
-        let dur = asset.duration_us.max(SECOND_US);
-        match asset.kind {
-            AssetKind::Video => {
-                self.project.video_tracks[0].clips.push(VideoClip {
-                    asset: AssetId(id.0),
-                    source_in: 0,
-                    source_out: dur,
-                    timeline_start: start,
-                    opacity: 1.0,
-                    transform: Transform::default(),
+    fn add_track(&mut self, kind: u8) {
+        self.push_undo();
+        match kind {
+            0 => {
+                let n = self.project.video_tracks.len() + 1;
+                self.project.video_tracks.push(Track {
+                    name: format!("V{n}"),
+                    ..Default::default()
                 });
             }
-            AssetKind::Audio => {
-                self.project.audio_tracks[0].clips.push(AudioClip {
-                    asset: AssetId(id.0),
-                    source_in: 0,
-                    source_out: dur,
-                    timeline_start: start,
-                    gain_db: 0.0,
-                    fade_in_us: 200_000,
-                    fade_out_us: 200_000,
+            1 => {
+                let n = self.project.audio_tracks.len() + 1;
+                self.project.audio_tracks.push(Track {
+                    name: format!("A{n}"),
+                    ..Default::default()
                 });
             }
-            AssetKind::Image => {
-                self.project.video_tracks[0].clips.push(VideoClip {
-                    asset: AssetId(id.0),
-                    source_in: 0,
-                    source_out: SECOND_US * 3,
-                    timeline_start: start,
-                    opacity: 1.0,
-                    transform: Transform::default(),
-                });
-            }
-        }
-        if let AssetKind::Video | AssetKind::Audio = asset.kind {
-            self.audio.refresh(&self.project);
+            _ => {}
         }
         self.last_request = None;
     }
 
-    fn add_text_clip(&mut self) {
-        let start = self.playhead_us;
-        let end = start + 3 * SECOND_US;
-        self.project.text_tracks[0].clips.push(TextClip {
-            text: "New title".into(),
-            timeline_start: start,
-            timeline_end: end,
-            style: TextStyle::default(),
-            transform: Transform::default(),
-            opacity: 1.0,
+    fn handle_keybinds(&mut self, ctx: &egui::Context) {
+        let kb = self.keybinds;
+        ctx.input_mut(|i| {
+            // Most-specific shortcuts first (redo before undo).
+            if i.consume_shortcut(&kb.redo) {
+                self.redo();
+            } else if i.consume_shortcut(&kb.undo) {
+                self.undo();
+            } else if i.consume_shortcut(&kb.delete_clip) {
+                self.delete_selected();
+            } else if i.consume_shortcut(&kb.split_clip) {
+                match self.selected {
+                    Selection::Video { track, clip } => self.split_video(track, clip),
+                    Selection::Audio { track, clip } => self.split_audio(track, clip),
+                    _ => {}
+                }
+            } else if i.consume_shortcut(&kb.play_pause) {
+                self.toggle_play();
+            } else if i.consume_shortcut(&kb.step_fwd) {
+                self.step_frame(1);
+            } else if i.consume_shortcut(&kb.step_back) {
+                self.step_frame(-1);
+            } else if i.consume_shortcut(&kb.jump_start) {
+                self.playhead_us = 0;
+                self.seek_marker();
+            } else if i.consume_shortcut(&kb.jump_end) {
+                self.playhead_us = self.project.duration_us().max(SECOND_US);
+                self.seek_marker();
+            } else if i.consume_shortcut(&kb.export_render) {
+                self.export_open = !self.export_open;
+            } else if i.consume_shortcut(&kb.add_text) {
+                self.add_text_clip();
+            } else if i.consume_shortcut(&kb.toggle_peaks) {
+                self.show_peaks = !self.show_peaks;
+            } else if i.consume_shortcut(&kb.add_video_track) {
+                self.add_track(0);
+            } else if i.consume_shortcut(&kb.add_audio_track) {
+                self.add_track(1);
+            } else if i.consume_shortcut(&kb.close_window) {
+                self.export_open = false;
+                self.keybinds_open = false;
+            }
+        });
+    }
+}
+
+fn top_video_clip(p: &Project, t: Timecode) -> Option<(usize, &VideoClip)> {
+    p.video_tracks.iter().enumerate().rev().find_map(|(ti, tr)| {
+        tr.clips
+            .iter()
+            .find(|c| {
+                c.timeline_start <= t && t < c.timeline_start + (c.source_out - c.source_in)
+            })
+            .map(|c| (ti, c))
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  eframe app loop
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl eframe::App for FastCutterApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Transport clock driven by audio engine when playing.
+        if self.playing {
+            let pos = self.audio.pos_us();
+            if pos > self.playhead_us as f64 {
+                self.playhead_us = pos as i64;
+            }
+            if self.playhead_us > self.project.duration_us().max(SECOND_US) {
+                self.playhead_us = 0;
+                self.audio.set_pos_us(0.0);
+                self.playing = false;
+                self.audio.pause();
+            }
+        }
+
+        // Keyboard shortcuts.
+        self.handle_keybinds(ctx);
+
+        // Files dropped onto the window (from the OS file manager).
+        let dropped: Vec<PathBuf> = ctx
+            .input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for p in dropped {
+            self.import_media(p);
+        }
+
+        self.request_frame();
+        if self.preview_texture.is_none() {
+            let size = [PREVIEW_W as usize, PREVIEW_H as usize];
+            let s = ctx.load_texture(
+                "preview",
+                egui::ColorImage::new(size, Color32::from_rgb(8, 8, 10)),
+                egui::TextureOptions::LINEAR,
+            );
+            self.preview_texture = Some(s);
+        }
+        if self.preview_rendered_pts
+            != Some(self.playhead_us.min(self.project.duration_us().max(SECOND_US)))
+        {
+            self.compute_preview();
+        }
+
+        // Panels.
+        self.menu_bar(ctx);
+        self.transport_bar(ctx);
+        self.media_panel(ctx);
+        self.inspector(ctx);
+        self.timeline(ctx);
+        self.preview_panel(ctx);
+        if self.export_open {
+            self.export_window(ctx);
+        }
+        if self.keybinds_open {
+            self.keybinds_window(ctx);
+        }
+        self.status_bar(ctx);
+
+        // Clear a pending media drag when the pointer was released.
+        if ctx.input(|i| i.pointer.any_released()) {
+            self.drag_source = None;
+        }
+        ctx.request_repaint();
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  Panels
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl FastCutterApp {
+    // ── Menu bar ─────────────────────────────────────────────────────────────
+    fn menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui
+                        .add(egui::Button::new("Import media..."))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.pick_and_import();
+                    }
+                    if ui.add(egui::Button::new("Export...").shortcut_text("Ctrl+E")).clicked() {
+                        ui.close_menu();
+                        self.export_open = true;
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.add(egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                        ui.close_menu();
+                        self.undo();
+                    }
+                    if ui
+                        .add(egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.redo();
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Delete clip").shortcut_text("Delete")).clicked() {
+                        ui.close_menu();
+                        self.delete_selected();
+                    }
+                    if ui
+                        .add(egui::Button::new("Split at playhead").shortcut_text("Ctrl+S"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.split_selected();
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Add text clip").shortcut_text("Ctrl+T")).clicked() {
+                        ui.close_menu();
+                        self.add_text_clip();
+                    }
+                    if ui
+                        .add(egui::Button::new("Add video track").shortcut_text("Ctrl+Shift+V"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.add_track(0);
+                    }
+                    if ui
+                        .add(egui::Button::new("Add audio track").shortcut_text("Ctrl+Shift+A"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.add_track(1);
+                    }
+                    ui.separator();
+                    if ui
+                        .add(egui::Button::new("Toggle audio peaks").shortcut_text("P"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.show_peaks = !self.show_peaks;
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.add(egui::Button::new("Keybinds").shortcut_text("?")) .clicked() {
+                        ui.close_menu();
+                        self.keybinds_open = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
         });
     }
 
-    fn inspector(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("inspector")
+    // ── Transport bar ────────────────────────────────────────────────────────
+    fn transport_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("transport").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let play_label = if self.playing { "Stop" } else { "Play" };
+                if ui
+                    .add_sized([44.0, 26.0], egui::Button::new(play_label).fill(BUTTON))
+                    .on_hover_text(shortcut_label(self.keybinds.play_pause))
+                    .clicked()
+                {
+                    self.toggle_play();
+                }
+                if ui
+                    .add_sized([26.0, 26.0], egui::Button::new("<|").fill(BUTTON))
+                    .on_hover_text(shortcut_label(self.keybinds.jump_start))
+                    .clicked()
+                {
+                    self.playhead_us = 0;
+                    self.seek_marker();
+                }
+                if ui
+                    .add_sized([26.0, 26.0], egui::Button::new("<").fill(BUTTON))
+                    .on_hover_text(shortcut_label(self.keybinds.step_back))
+                    .clicked()
+                {
+                    self.step_frame(-1);
+                }
+                if ui
+                    .add_sized([26.0, 26.0], egui::Button::new(">").fill(BUTTON))
+                    .on_hover_text(shortcut_label(self.keybinds.step_fwd))
+                    .clicked()
+                {
+                    self.step_frame(1);
+                }
+                if ui
+                    .add_sized([26.0, 26.0], egui::Button::new(">|").fill(BUTTON))
+                    .on_hover_text(shortcut_label(self.keybinds.jump_end))
+                    .clicked()
+                {
+                    self.playhead_us = self.project.duration_us().max(SECOND_US);
+                    self.seek_marker();
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} / {}",
+                        timecode_string(self.playhead_us, self.project.fps),
+                        timecode_string(self.project.duration_us(), self.project.fps)
+                    ))
+                    .monospace()
+                    .color(WHITE),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                if ui
+                    .add_sized(
+                        [60.0, 26.0],
+                        egui::Button::new("Export").fill(ACCENT),
+                    )
+                    .on_hover_text(shortcut_label(self.keybinds.export_render))
+                    .clicked()
+                {
+                    self.export_open = true;
+                }
+            });
+            ui.add_space(2.0);
+        });
+    }
+
+    // ── Media panel (left, tabbed, drag-drop) ────────────────────────────────
+    fn media_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("media")
             .resizable(true)
             .default_width(280.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.strong("Clip");
-                ui.separator();
-                match self.selected {
-                    Selection::None => {
-                        ui.label("Select a clip in the timeline to edit.");
+                ui.strong("Media");
+                ui.add_space(4.0);
+
+                // Tab bar.
+                ui.horizontal(|ui| {
+                    for (label, tab) in [
+                        ("All", MediaTab::All),
+                        ("Video", MediaTab::Video),
+                        ("Audio", MediaTab::Audio),
+                    ] {
+                        let selected = self.media_tab == tab;
+                        let btn = if selected {
+                            egui::Button::new(RichText::new(label).color(ACCENT))
+                                .fill(BUTTON)
+                                .stroke(egui::Stroke::new(1.0, ACCENT))
+                        } else {
+                            egui::Button::new(RichText::new(label).color(WHITE)).fill(BUTTON)
+                        };
+                        if ui.add_sized([58.0, 22.0], btn).clicked() {
+                            self.media_tab = tab;
+                        }
                     }
-                    Selection::Video { track, clip } => {
-                        self.inspect_video(ui, track, clip);
-                    }
-                    Selection::Audio { track, clip } => {
-                        self.inspect_audio(ui, track, clip);
-                    }
-                    Selection::Text { track, clip } => {
-                        self.inspect_text(ui, track, clip);
-                    }
+                });
+
+                ui.add_space(4.0);
+
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 26.0],
+                        egui::Button::new(RichText::new("+ Import").color(WHITE)).fill(ACCENT),
+                    )
+                    .clicked()
+                {
+                    self.pick_and_import();
                 }
+
+                ui.add_space(4.0);
                 ui.separator();
-                if ui.button("+ Add text clip").clicked() {
-                    self.add_text_clip();
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("Drag clips onto the timeline, or double-click to add.")
+                        .small()
+                        .color(Color32::from_rgb(140, 140, 150)),
+                );
+                ui.add_space(4.0);
+
+                let mut add_id: Option<AssetId> = None;
+                let mut remove_id: Option<AssetId> = None;
+                let ids: Vec<AssetId> = self.project.assets.assets.keys().copied().collect();
+                let fps = self.project.fps;
+
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height())
+                    .show(ui, |ui| {
+                        for id in ids {
+                            let Some(a) = self.project.assets.get(id) else {
+                                continue;
+                            };
+                            let visible = match self.media_tab {
+                                MediaTab::All => true,
+                                MediaTab::Video => {
+                                    matches!(a.kind, AssetKind::Video | AssetKind::Image)
+                                }
+                                MediaTab::Audio => a.kind == AssetKind::Audio,
+                            };
+                            if !visible {
+                                continue;
+                            }
+
+                            let (badge, bg) = match a.kind {
+                                AssetKind::Video => ("V", VIDEO_CLIP),
+                                AssetKind::Audio => ("A", AUDIO_CLIP),
+                                AssetKind::Image => ("I", TEXT_CLIP),
+                            };
+
+                            let item_response = ui.allocate_response(
+                                egui::vec2(ui.available_width(), 30.0),
+                                Sense::click_and_drag(),
+                            );
+
+                            // Background.
+                            let bg_col = if item_response.hovered() || item_response.dragged() {
+                                TRACK
+                            } else {
+                                PANEL
+                            };
+                            ui.painter()
+                                .rect_filled(item_response.rect, 3.0, bg_col);
+
+                            // Badge.
+                            let badge_rect = Rect::from_min_size(
+                                item_response.rect.min + egui::vec2(4.0, 5.0),
+                                egui::vec2(20.0, 20.0),
+                            );
+                            ui.painter().rect_filled(badge_rect, 3.0, bg);
+                            ui.painter().text(
+                                badge_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                badge,
+                                egui::FontId::proportional(10.0),
+                                Color32::from_rgb(230, 230, 235),
+                            );
+
+                            // Name + duration.
+                            ui.painter().text(
+                                item_response.rect.min + egui::vec2(30.0, 9.0),
+                                egui::Align2::LEFT_CENTER,
+                                format!(
+                                    "{}  [{}]",
+                                    a.name,
+                                    timecode_string(a.duration_us, fps)
+                                ),
+                                egui::FontId::proportional(11.0),
+                                WHITE,
+                            );
+
+                            // Drag from media -> timeline.
+                            if item_response.dragged() {
+                                self.drag_source = Some(id);
+                                ui.painter().rect_stroke(
+                                    item_response.rect,
+                                    3.0,
+                                    egui::Stroke::new(1.0, ACCENT),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                            // Double-click adds to the end of the timeline.
+                            if item_response.double_clicked() {
+                                add_id = Some(id);
+                            }
+                            // Right-click removes the asset.
+                            if item_response.secondary_clicked() {
+                                remove_id = Some(id);
+                            }
+                        }
+                    });
+
+                ui.add_space(2.0);
+                ui.separator();
+                ui.checkbox(&mut self.show_peaks, "Show audio peaks");
+
+                if let Some(id) = add_id {
+                    self.push_undo();
+                    self.add_clip_from_media(id);
                 }
-                ui.separator();
-                ui.strong("Keyboard");
-                ui.label("Space play/pause · ←/→ step frames");
+                if let Some(id) = remove_id {
+                    self.push_undo();
+                    self.remove_asset(id);
+                }
             });
     }
 
-    fn inspect_video(&mut self, ui: &mut egui::Ui, track: usize, clip: usize) {
-        let Some(tr) = self.project.video_tracks.get(track) else { return };
-        let Some(c) = tr.clips.get(clip).cloned() else { return };
-        let s = crate::audio::timecode_string(c.source_out - c.source_in, self.project.fps);
-        ui.label(format!("Duration: {s}"));
-        let mut t = c.transform;
-        ui.add(
-            egui::Slider::new(&mut t.x, 0.0..=1.0)
-                .text("X")
-                .fixed_decimals(2),
-        );
-        ui.add(
-            egui::Slider::new(&mut t.y, 0.0..=1.0)
-                .text("Y")
-                .fixed_decimals(2),
-        );
-        ui.add(
-            egui::Slider::new(&mut t.scale, 0.1..=3.0)
-                .text("Scale")
-                .fixed_decimals(2),
-        );
-        ui.add(
-            egui::Slider::new(&mut t.rotate, -180.0..=180.0)
-                .text("Rotate°")
-                .fixed_decimals(1),
-        );
-        let mut opacity = c.opacity;
-        if ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity")).changed() {
-            if let Some(c) = self.project.video_tracks[track].clips.get_mut(clip) {
-                c.opacity = opacity;
+    // ── Preview viewport (center) ────────────────────────────────────────────
+    fn preview_panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(tex) = &self.preview_texture {
+                let avail = ui.available_size();
+                let aspect = PREVIEW_W as f32 / PREVIEW_H as f32;
+                let mut size = avail;
+                if size.x / size.y > aspect {
+                    size.x = size.y * aspect;
+                } else {
+                    size.y = size.x / aspect;
+                }
+                if size.x < 8.0 || size.y < 8.0 {
+                    return;
+                }
+                let center = ui.available_rect_before_wrap().center();
+                let img_rect = Rect::from_center_size(center, size);
+                ui.painter()
+                    .rect_stroke(
+                        img_rect.shrink(1.0),
+                        2.0,
+                        egui::Stroke::new(1.0, TRACK),
+                        StrokeKind::Inside,
+                    );
+                let sized = egui::load::SizedTexture::new(tex.id(), size);
+                ui.put(
+                    img_rect,
+                    egui::Image::new(sized).fit_to_exact_size(size),
+                );
             }
-        }
-        if t != c.transform {
-            if let Some(c) = self.project.video_tracks[track].clips.get_mut(clip) {
-                c.transform = t;
-            }
-        }
-        ui.separator();
-        if ui.button("Split at playhead").clicked() {
-            self.split_video(track, clip);
-        }
+        });
     }
 
-    fn inspect_audio(&mut self, ui: &mut egui::Ui, track: usize, clip: usize) {
-        let Some(tr) = self.project.audio_tracks.get(track) else { return };
-        let Some(c) = tr.clips.get(clip).cloned() else { return };
-        let s = crate::audio::timecode_string(c.source_out - c.source_in, self.project.fps);
-        ui.label(format!("Duration: {s}"));
-        let mut gain = c.gain_db;
-        if ui.add(egui::Slider::new(&mut gain, -60.0..=12.0).text("Gain dB")).changed() {
-            if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
-                c.gain_db = gain;
-            }
-        }
-        let mut fi = c.fade_in_us;
-        let mut fo = c.fade_out_us;
-        if ui
-            .add(egui::Slider::new(&mut fi, 0..=5_000_000).text("Fade in "))
-            .changed()
-        {
-            if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
-                c.fade_in_us = fi;
-            }
-        }
-        if ui
-            .add(egui::Slider::new(&mut fo, 0..=5_000_000).text("Fade out "))
-            .changed()
-        {
-            if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
-                c.fade_out_us = fo;
-            }
-        }
-        ui.separator();
-        if ui.button("Split at playhead").clicked() {
-            self.split_audio(track, clip);
-        }
-    }
-
-    fn inspect_text(&mut self, ui: &mut egui::Ui, track: usize, clip: usize) {
-        let Some(tr) = self.project.text_tracks.get(track) else { return };
-        let Some(c) = tr.clips.get(clip).cloned() else { return };
-        let mut text = c.text.clone();
-        if ui
-            .add(egui::TextEdit::multiline(&mut text).desired_rows(3))
-            .changed()
-        {
-            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
-                c.text = text;
-            }
-        }
-        let mut size = c.style.font_size;
-        if ui.add(egui::Slider::new(&mut size, 8.0..=120.0).text("Size")).changed() {
-            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
-                c.style.font_size = size;
-            }
-        }
-        let color = c.style.color;
-        let mut c32 = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-        if ui.color_edit_button_srgba(&mut c32).changed() {
-            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
-                c.style.color = [c32.r(), c32.g(), c32.b(), c32.a()];
-            }
-        }
-        let mut align = c.style.align;
-        egui::ComboBox::from_label("Align")
-            .selected_text(format!("{align:?}"))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut align, TextAlign::Left, "Left");
-                ui.selectable_value(&mut align, TextAlign::Center, "Center");
-                ui.selectable_value(&mut align, TextAlign::Right, "Right");
-            });
-        if align != c.style.align {
-            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
-                c.style.align = align;
-            }
-        }
-    }
-
-    fn split_video(&mut self, track: usize, clip: usize) {
-        let pt = self.playhead_us;
-        let Some(c) = self.project.video_tracks[track].clips.get(clip).cloned() else {
-            return;
-        };
-        let start = c.timeline_start;
-        let end = start + (c.source_out - c.source_in);
-        if pt <= start || pt >= end {
-            return;
-        }
-        let src = c.source_in + (pt - start);
-        let tr = &mut self.project.video_tracks[track];
-        tr.clips[clip].source_out = src;
-        tr.clips.insert(
-            clip + 1,
-            VideoClip {
-                asset: c.asset,
-                source_in: src,
-                source_out: c.source_out,
-                timeline_start: pt,
-                opacity: c.opacity,
-                transform: c.transform,
-            },
-        );
-    }
-
-    fn split_audio(&mut self, track: usize, clip: usize) {
-        let pt = self.playhead_us;
-        let Some(c) = self.project.audio_tracks[track].clips.get(clip).cloned() else {
-            return;
-        };
-        let start = c.timeline_start;
-        let end = start + (c.source_out - c.source_in);
-        if pt <= start || pt >= end {
-            return;
-        }
-        let src = c.source_in + (pt - start);
-        let tr = &mut self.project.audio_tracks[track];
-        tr.clips[clip].source_out = src;
-        tr.clips.insert(
-            clip + 1,
-            AudioClip {
-                asset: c.asset,
-                source_in: src,
-                source_out: c.source_out,
-                timeline_start: pt,
-                gain_db: c.gain_db,
-                fade_in_us: c.fade_in_us,
-                fade_out_us: c.fade_out_us,
-            },
-        );
-        self.audio.refresh(&self.project);
-    }
-
+    // ── Timeline (bottom) ────────────────────────────────────────────────────
     fn timeline(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
-            .default_height(200.0)
+            .default_height(220.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.strong("Timeline");
                     ui.separator();
-                    if ui.small_button("+ Video/Audio").clicked() {
-                        // quick append of first media asset
-                        if let Some(id) = self.project.assets.assets.keys().next().copied() {
-                            self.add_clip_from_media(id);
-                        }
-                    }
                     if ui.small_button("+ Text").clicked() {
                         self.add_text_clip();
                     }
+                    if ui.small_button("+ Video track").clicked() {
+                        self.add_track(0);
+                    }
+                    if ui.small_button("+ Audio track").clicked() {
+                        self.add_track(1);
+                    }
                     ui.separator();
-                    ui.checkbox(&mut self.project.video_tracks[0].muted, "V1 mute");
-                    ui.checkbox(&mut self.project.audio_tracks[0].muted, "A1 mute");
+                    for i in 0..self.project.video_tracks.len() {
+                        let name = self.project.video_tracks[i].name.clone();
+                        let mut muted = self.project.video_tracks[i].muted;
+                        if ui.checkbox(&mut muted, &name).changed() {
+                            self.project.video_tracks[i].muted = muted;
+                        }
+                    }
+                    for i in 0..self.project.audio_tracks.len() {
+                        let name = self.project.audio_tracks[i].name.clone();
+                        let mut muted = self.project.audio_tracks[i].muted;
+                        if ui.checkbox(&mut muted, &name).changed() {
+                            self.project.audio_tracks[i].muted = muted;
+                            self.audio.refresh(&self.project);
+                        }
+                    }
                 });
                 ui.separator();
+
                 let usize_dur = self.project.duration_us().max(SECOND_US);
                 let w = ui.available_width().max(320.0);
                 let row_h = 34.0;
+                let ruler_h = 18.0;
+                let vid_rows = self.project.video_tracks.len().max(1);
+                let aud_rows = self.project.audio_tracks.len().max(1);
+                let txt_rows = self.project.text_tracks.len().max(1);
+                let total_rows = (vid_rows + aud_rows + txt_rows) as f32;
+                let total_h = ruler_h + total_rows * row_h;
+
                 let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(w, row_h * 3.0 + 24.0),
-                    egui::Sense::click(),
+                    egui::vec2(w, total_h),
+                    Sense::click_and_drag(),
                 );
                 let painter = ui.painter_at(rect);
-
-                // Time ruler
                 painter.rect_filled(rect, 2.0, PANEL);
-                let ruler_h = 18.0;
-                let t0 = 0.0f32;
-                let t1 = w;
-                let step_markers = SECOND_US as f32 * (w / usize_dur.max(1) as f32).max(0.01);
 
-                // Draw a few tick labels
-                let total = w as f64 / (usize_dur as f64 / SECOND_US as f64).max(1.0);
-                let _ = total;
-                let _ = t0;
-                let _ = t1;
-                let _ = step_markers;
+                // Time ruler.
                 let sec_px = w / (usize_dur as f32 / SECOND_US as f32).max(1.0);
                 let mut s = 0;
                 let mut x = 0.0;
@@ -654,20 +842,23 @@ impl FastCutterApp {
                         egui::Align2::LEFT_TOP,
                         format!("{s}s"),
                         egui::FontId::proportional(10.0),
-                        WHITE,
+                        Color32::from_rgb(150, 150, 160),
                     );
                     s += 1;
                     x += sec_px;
                 }
 
                 // Track lanes.
-                let mut clicks: Vec<(usize, usize, u8)> = Vec::new();
+                let mut clicks: Vec<(usize, usize, u8, Rect)> = Vec::new();
+                // Simplify: draw lanes inline below.
+                let mut lane_rects: Vec<(u8, usize, Rect)> = Vec::new();
+
+                // Video lanes.
                 for (ti, tr) in self.project.clone().video_tracks.iter().enumerate() {
                     let y0 = rect.min.y + ruler_h + ti as f32 * row_h;
-                    let y1 = y0 + row_h - 3.0;
-                    let lane = egui::Rect::from_min_max(
+                    let lane = Rect::from_min_max(
                         egui::pos2(rect.min.x, y0),
-                        egui::pos2(rect.max.x, y1),
+                        egui::pos2(rect.max.x, y0 + row_h - 3.0),
                     );
                     painter.rect_filled(lane, 2.0, TRACK);
                     painter.text(
@@ -675,17 +866,16 @@ impl FastCutterApp {
                         egui::Align2::LEFT_CENTER,
                         tr.name.clone(),
                         egui::FontId::proportional(11.0),
-                        WHITE,
+                        Color32::from_rgb(180, 180, 190),
                     );
+                    lane_rects.push((0, ti, lane));
                     for (ci, c) in tr.clips.iter().enumerate() {
-                        let cw = ((c.source_out - c.source_in) as f32 / usize_dur as f32 * w).max(6.0);
+                        let cw = ((c.source_out - c.source_in) as f32 / usize_dur as f32 * w)
+                            .max(6.0);
                         let cx = (c.timeline_start as f32 / usize_dur as f32 * w).max(0.0);
-                        let cr = egui::Rect::from_min_max(
+                        let cr = Rect::from_min_max(
                             egui::pos2(rect.min.x + cx + 2.0, y0 + 2.0),
-                            egui::pos2(
-                                rect.min.x + cx + cw - 2.0,
-                                y1 - 2.0,
-                            ),
+                            egui::pos2(rect.min.x + cx + cw - 2.0, y0 + row_h - 5.0),
                         );
                         painter.rect_filled(cr, 2.0, VIDEO_CLIP);
                         painter.text(
@@ -695,20 +885,20 @@ impl FastCutterApp {
                             egui::FontId::proportional(10.0),
                             WHITE,
                         );
-                        // click region
-                        if response.hover_pos().is_some_and(|p| cr.contains(p)) && response.clicked() {
-                            clicks.push((ti, ci, 1));
+                        if let Some(p) = response.hover_pos() {
+                            if cr.contains(p) && response.clicked() {
+                                clicks.push((ti, ci, 0u8, cr));
+                            }
                         }
                     }
                 }
-                // audio tracks second block (different rows)
-                let vid_rows = self.project.video_tracks.len();
+
+                // Audio lanes.
                 for (ai, tr) in self.project.clone().audio_tracks.iter().enumerate() {
                     let y0 = rect.min.y + ruler_h + (vid_rows + ai) as f32 * row_h;
-                    let y1 = y0 + row_h - 3.0;
-                    let lane = egui::Rect::from_min_max(
+                    let lane = Rect::from_min_max(
                         egui::pos2(rect.min.x, y0),
-                        egui::pos2(rect.max.x, y1),
+                        egui::pos2(rect.max.x, y0 + row_h - 3.0),
                     );
                     painter.rect_filled(lane, 2.0, TRACK);
                     painter.text(
@@ -716,14 +906,16 @@ impl FastCutterApp {
                         egui::Align2::LEFT_CENTER,
                         tr.name.clone(),
                         egui::FontId::proportional(11.0),
-                        WHITE,
+                        Color32::from_rgb(180, 180, 190),
                     );
+                    lane_rects.push((1, ai, lane));
                     for (ci, c) in tr.clips.iter().enumerate() {
-                        let cw = ((c.source_out - c.source_in) as f32 / usize_dur as f32 * w).max(6.0);
+                        let cw = ((c.source_out - c.source_in) as f32 / usize_dur as f32 * w)
+                            .max(6.0);
                         let cx = (c.timeline_start as f32 / usize_dur as f32 * w).max(0.0);
-                        let cr = egui::Rect::from_min_max(
+                        let cr = Rect::from_min_max(
                             egui::pos2(rect.min.x + cx + 2.0, y0 + 4.0),
-                            egui::pos2(rect.min.x + cx + cw - 2.0, y1 - 4.0),
+                            egui::pos2(rect.min.x + cx + cw - 2.0, y0 + row_h - 7.0),
                         );
                         painter.rect_filled(cr, 2.0, AUDIO_CLIP);
                         if let Some(asset) = self.project.assets.get(c.asset) {
@@ -758,19 +950,20 @@ impl FastCutterApp {
                                 }
                             }
                         }
-                        if response.hover_pos().is_some_and(|p| cr.contains(p)) && response.clicked() {
-                            clicks.push((ai, ci, 2));
+                        if let Some(p) = response.hover_pos() {
+                            if cr.contains(p) && response.clicked() {
+                                clicks.push((ai, ci, 1u8, cr));
+                            }
                         }
                     }
                 }
-                // text tracks
-                let base_rows = vid_rows + self.project.audio_tracks.len();
+
+                // Text lanes.
                 for (ti, tr) in self.project.clone().text_tracks.iter().enumerate() {
-                    let y0 = rect.min.y + ruler_h + (base_rows + ti) as f32 * row_h;
-                    let y1 = y0 + row_h - 3.0;
-                    let lane = egui::Rect::from_min_max(
+                    let y0 = rect.min.y + ruler_h + (vid_rows + aud_rows + ti) as f32 * row_h;
+                    let lane = Rect::from_min_max(
                         egui::pos2(rect.min.x, y0),
-                        egui::pos2(rect.max.x, y1),
+                        egui::pos2(rect.max.x, y0 + row_h - 3.0),
                     );
                     painter.rect_filled(lane, 2.0, TRACK);
                     painter.text(
@@ -778,54 +971,486 @@ impl FastCutterApp {
                         egui::Align2::LEFT_CENTER,
                         tr.name.clone(),
                         egui::FontId::proportional(11.0),
-                        WHITE,
+                        Color32::from_rgb(180, 180, 190),
                     );
                     for (ci, c) in tr.clips.iter().enumerate() {
                         let cw = ((c.timeline_end - c.timeline_start) as f32 / usize_dur as f32 * w)
                             .max(6.0);
                         let cx = (c.timeline_start as f32 / usize_dur as f32 * w).max(0.0);
-                        let cr = egui::Rect::from_min_max(
+                        let cr = Rect::from_min_max(
                             egui::pos2(rect.min.x + cx + 2.0, y0 + 4.0),
-                            egui::pos2(rect.min.x + cx + cw - 2.0, y1 - 4.0),
+                            egui::pos2(rect.min.x + cx + cw - 2.0, y0 + row_h - 7.0),
                         );
                         painter.rect_filled(cr, 2.0, TEXT_CLIP);
-                        if response.hover_pos().is_some_and(|p| cr.contains(p)) && response.clicked() {
-                            clicks.push((ti, ci, 3));
+                        if let Some(p) = response.hover_pos() {
+                            if cr.contains(p) && response.clicked() {
+                                clicks.push((ti, ci, 2u8, cr));
+                            }
                         }
                     }
                 }
 
-                if let Some((ti, ci, kind)) = clicks.last().copied() {
+                // Selection on click.
+                if let Some((ti, ci, kind, _)) = clicks.last().copied() {
                     self.selected = match kind {
-                        1 => Selection::Video { track: ti, clip: ci },
-                        2 => Selection::Audio { track: ti, clip: ci },
+                        0 => Selection::Video { track: ti, clip: ci },
+                        1 => Selection::Audio { track: ti, clip: ci },
                         _ => Selection::Text { track: ti, clip: ci },
                     };
                 }
 
-                // Playhead line
+                // Playhead.
                 let px = rect.min.x
                     + (self.playhead_us as f32 / usize_dur as f32 * w).clamp(0.0, w);
                 painter.line_segment(
-                    [
-                        egui::pos2(px, rect.min.y),
-                        egui::pos2(px, rect.max.y),
-                    ],
+                    [egui::pos2(px, rect.min.y), egui::pos2(px, rect.max.y)],
                     egui::Stroke::new(2.0, PLAYHEAD),
                 );
 
                 // Click on ruler seeks.
-                if response.clicked() && response.hover_pos().is_some() {
-                    let p = response.hover_pos().unwrap();
-                    if p.y < rect.min.y + ruler_h {
-                        let frac = ((p.x - rect.min.x) / w).clamp(0.0, 1.0);
-                        self.playhead_us = (usize_dur as f64 * frac as f64) as i64;
-                        self.seek_marker();
+                if response.clicked() {
+                    if let Some(p) = response.hover_pos() {
+                        if p.y < rect.min.y + ruler_h {
+                            let frac = ((p.x - rect.min.x) / w).clamp(0.0, 1.0);
+                            self.playhead_us = (usize_dur as f64 * frac as f64) as i64;
+                            self.seek_marker();
+                        }
+                    }
+                }
+
+                // Drag-drop from the media panel: while dragging show a ghost,
+                // on release add the clip at the drop position/lane.
+                if let Some(src) = self.drag_source {
+                    let dragging = ctx.input(|i| i.pointer.primary_down());
+                    if dragging {
+                        if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                            if rect.contains(p) {
+                                let frac = ((p.x - rect.min.x) / w).clamp(0.0, 1.0);
+                                let drop_us = (usize_dur as f64 * frac as f64) as i64;
+                                self.drag_timeline_us = Some(drop_us);
+                                // Ghost.
+                                let gx = rect.min.x + frac * w;
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(gx, rect.min.y),
+                                        egui::pos2(gx, rect.max.y),
+                                    ],
+                                    egui::Stroke::new(1.0, ACCENT),
+                                );
+                            }
+                        }
+                    }
+                    if ctx.input(|i| i.pointer.any_released()) {
+                        let drop_us =
+                            self.drag_timeline_us.unwrap_or(self.project.duration_us());
+                        if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                            if rect.contains(p) {
+                                // Find lane under the pointer.
+                                let mut target: Option<(u8, usize)> = None;
+                                for (kind, idx, lane) in &lane_rects {
+                                    if lane.contains(p) {
+                                        target = Some((*kind, *idx));
+                                        break;
+                                    }
+                                }
+                                if let Some((kind, idx)) = target {
+                                    self.push_undo();
+                                    self.add_clip_at(src, kind, idx, drop_us);
+                                }
+                            }
+                        }
+                        self.drag_source = None;
+                        self.drag_timeline_us = None;
                     }
                 }
             });
     }
 
+    // ── Import / asset helpers ───────────────────────────────────────────────
+    fn pick_and_import(&mut self) {
+        let path = rfd::FileDialog::new()
+            .set_title("Import media")
+            .add_filter(
+                "Media",
+                &[
+                    "mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "aac", "flac", "ogg",
+                    "png", "jpg", "jpeg", "webp",
+                ],
+            )
+            .pick_file();
+        if let Some(p) = path {
+            self.import_media(p);
+        }
+    }
+
+    fn import_media(&mut self, path: PathBuf) {
+        let path_s = path.to_string_lossy().into_owned();
+        match crate::assets::import_media(&mut self.project.assets, &path_s) {
+            Ok(id) => {
+                self.audio.refresh(&self.project);
+                self.toasts.push(format!(
+                    "Imported {}",
+                    self.project
+                        .assets
+                        .get(id)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_default()
+                ));
+            }
+            Err(e) => self.toasts.push(format!("Import failed: {e}")),
+        }
+    }
+
+    fn remove_asset(&mut self, id: AssetId) {
+        let used_video = self
+            .project
+            .video_tracks
+            .iter()
+            .any(|t| t.clips.iter().any(|c| c.asset == id));
+        let used_audio = self
+            .project
+            .audio_tracks
+            .iter()
+            .any(|t| t.clips.iter().any(|c| c.asset == id));
+        if used_video || used_audio {
+            self.toasts.push("Remove clips first".into());
+            return;
+        }
+        self.project.assets.assets.remove(&id);
+        self.audio.refresh(&self.project);
+    }
+
+    fn add_clip_from_media(&mut self, id: AssetId) {
+        let Some(asset) = self.project.assets.get(id).cloned() else {
+            return;
+        };
+        let start = self.project.duration_us();
+        match asset.kind {
+            AssetKind::Video => self.add_clip_at(id, 0, 0, start),
+            AssetKind::Image => self.add_clip_at(id, 0, 0, start),
+            AssetKind::Audio => self.add_clip_at(id, 1, 0, start),
+        }
+        if asset.kind != AssetKind::Image {
+            self.audio.refresh(&self.project);
+        }
+        self.last_request = None;
+    }
+
+    /// Insert an asset as a clip on lane `kind` (0=video, 1=audio) at `time_us`.
+    fn add_clip_at(&mut self, id: AssetId, kind: u8, track: usize, time_us: i64) {
+        let Some(asset) = self.project.assets.get(id).cloned() else {
+            return;
+        };
+        let dur = asset.duration_us.max(SECOND_US);
+        match kind {
+            0 => {
+                let idx = track.min(self.project.video_tracks.len().saturating_sub(1));
+                match asset.kind {
+                    AssetKind::Image => {
+                        self.project.video_tracks[idx].clips.push(VideoClip {
+                            asset: AssetId(id.0),
+                            source_in: 0,
+                            source_out: 3 * SECOND_US,
+                            timeline_start: time_us,
+                            opacity: 1.0,
+                            transform: Transform::default(),
+                        });
+                    }
+                    _ => {
+                        self.project.video_tracks[idx].clips.push(VideoClip {
+                            asset: AssetId(id.0),
+                            source_in: 0,
+                            source_out: dur,
+                            timeline_start: time_us,
+                            opacity: 1.0,
+                            transform: Transform::default(),
+                        });
+                    }
+                }
+            }
+            1 => {
+                let idx = track.min(self.project.audio_tracks.len().saturating_sub(1));
+                self.project.audio_tracks[idx].clips.push(AudioClip {
+                    asset: AssetId(id.0),
+                    source_in: 0,
+                    source_out: dur,
+                    timeline_start: time_us,
+                    gain_db: 0.0,
+                    fade_in_us: 200_000,
+                    fade_out_us: 200_000,
+                });
+            }
+            _ => {}
+        }
+        self.last_request = None;
+    }
+
+    fn add_text_clip(&mut self) {
+        let start = self.playhead_us;
+        let end = start + 3 * SECOND_US;
+        self.push_undo();
+        self.project.text_tracks[0].clips.push(TextClip {
+            text: "New title".into(),
+            timeline_start: start,
+            timeline_end: end,
+            style: TextStyle::default(),
+            transform: Transform::default(),
+            opacity: 1.0,
+        });
+    }
+
+    fn split_selected(&mut self) {
+        match self.selected {
+            Selection::Video { track, clip } => self.split_video(track, clip),
+            Selection::Audio { track, clip } => self.split_audio(track, clip),
+            _ => {}
+        }
+    }
+
+    // ── Inspector (right panel) ──────────────────────────────────────────────
+    fn inspector(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("inspector")
+            .resizable(true)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.strong("Inspector");
+                ui.separator();
+                match self.selected {
+                    Selection::None => {
+                        ui.label("Select a clip to edit.");
+                    }
+                    Selection::Video { track, clip } => {
+                        self.inspect_video(ui, track, clip);
+                    }
+                    Selection::Audio { track, clip } => {
+                        self.inspect_audio(ui, track, clip);
+                    }
+                    Selection::Text { track, clip } => {
+                        self.inspect_text(ui, track, clip);
+                    }
+                }
+                ui.separator();
+                if ui.button("+ Add text clip").clicked() {
+                    self.add_text_clip();
+                }
+            });
+    }
+
+    fn inspect_video(&mut self, ui: &mut egui::Ui, track: usize, clip: usize) {
+        let Some(tr) = self.project.video_tracks.get(track) else {
+            return;
+        };
+        let Some(c) = tr.clips.get(clip).cloned() else {
+            return;
+        };
+        let s = timecode_string(c.source_out - c.source_in, self.project.fps);
+        ui.label(format!("Duration: {s}"));
+        let mut t = c.transform;
+        ui.add(
+            egui::Slider::new(&mut t.x, 0.0..=1.0)
+                .text("X")
+                .fixed_decimals(2),
+        );
+        ui.add(
+            egui::Slider::new(&mut t.y, 0.0..=1.0)
+                .text("Y")
+                .fixed_decimals(2),
+        );
+        ui.add(
+            egui::Slider::new(&mut t.scale, 0.1..=3.0)
+                .text("Scale")
+                .fixed_decimals(2),
+        );
+        ui.add(
+            egui::Slider::new(&mut t.rotate, -180.0..=180.0)
+                .text("Rotate deg")
+                .fixed_decimals(0),
+        );
+        let mut opacity = c.opacity;
+        if ui
+            .add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"))
+            .changed()
+        {
+            if let Some(c) = self.project.video_tracks[track].clips.get_mut(clip) {
+                c.opacity = opacity;
+            }
+        }
+        if t != c.transform {
+            if let Some(c) = self.project.video_tracks[track].clips.get_mut(clip) {
+                c.transform = t;
+            }
+        }
+        ui.separator();
+        if ui.button("Split at playhead").clicked() {
+            self.split_video(track, clip);
+        }
+        if ui.button("Delete clip").clicked() {
+            self.push_undo();
+            self.project.video_tracks[track].clips.remove(clip);
+            self.selected = Selection::None;
+            self.audio.refresh(&self.project);
+        }
+    }
+
+    fn inspect_audio(&mut self, ui: &mut egui::Ui, track: usize, clip: usize) {
+        let Some(tr) = self.project.audio_tracks.get(track) else {
+            return;
+        };
+        let Some(c) = tr.clips.get(clip).cloned() else {
+            return;
+        };
+        let s = timecode_string(c.source_out - c.source_in, self.project.fps);
+        ui.label(format!("Duration: {s}"));
+        let mut gain = c.gain_db;
+        if ui
+            .add(egui::Slider::new(&mut gain, -60.0..=12.0).text("Gain dB"))
+            .changed()
+        {
+            if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
+                c.gain_db = gain;
+            }
+        }
+        let mut fi = c.fade_in_us;
+        let mut fo = c.fade_out_us;
+        if ui
+            .add(egui::Slider::new(&mut fi, 0..=5_000_000).text("Fade in (ms)"))
+            .changed()
+        {
+            if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
+                c.fade_in_us = fi;
+            }
+        }
+        if ui
+            .add(egui::Slider::new(&mut fo, 0..=5_000_000).text("Fade out (ms)"))
+            .changed()
+        {
+            if let Some(c) = self.project.audio_tracks[track].clips.get_mut(clip) {
+                c.fade_out_us = fo;
+            }
+        }
+        ui.separator();
+        if ui.button("Split at playhead").clicked() {
+            self.split_audio(track, clip);
+        }
+        if ui.button("Delete clip").clicked() {
+            self.push_undo();
+            self.project.audio_tracks[track].clips.remove(clip);
+            self.selected = Selection::None;
+            self.audio.refresh(&self.project);
+        }
+    }
+
+    fn inspect_text(&mut self, ui: &mut egui::Ui, track: usize, clip: usize) {
+        let Some(tr) = self.project.text_tracks.get(track) else {
+            return;
+        };
+        let Some(c) = tr.clips.get(clip).cloned() else {
+            return;
+        };
+        let mut text = c.text.clone();
+        if ui
+            .add(egui::TextEdit::multiline(&mut text).desired_rows(3))
+            .changed()
+        {
+            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
+                c.text = text;
+            }
+        }
+        let mut size = c.style.font_size;
+        if ui
+            .add(egui::Slider::new(&mut size, 8.0..=120.0).text("Size"))
+            .changed()
+        {
+            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
+                c.style.font_size = size;
+            }
+        }
+        let color = c.style.color;
+        let mut c32 = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+        if ui.color_edit_button_srgba(&mut c32).changed() {
+            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
+                c.style.color = [c32.r(), c32.g(), c32.b(), c32.a()];
+            }
+        }
+        let mut align = c.style.align;
+        egui::ComboBox::from_label("Align")
+            .selected_text(format!("{align:?}"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut align, TextAlign::Left, "Left");
+                ui.selectable_value(&mut align, TextAlign::Center, "Center");
+                ui.selectable_value(&mut align, TextAlign::Right, "Right");
+            });
+        if align != c.style.align {
+            if let Some(c) = self.project.text_tracks[track].clips.get_mut(clip) {
+                c.style.align = align;
+            }
+        }
+        ui.separator();
+        if ui.button("Delete clip").clicked() {
+            self.push_undo();
+            self.project.text_tracks[track].clips.remove(clip);
+            self.selected = Selection::None;
+        }
+    }
+
+    fn split_video(&mut self, track: usize, clip: usize) {
+        let pt = self.playhead_us;
+        let Some(c) = self.project.video_tracks[track].clips.get(clip).cloned() else {
+            return;
+        };
+        let start = c.timeline_start;
+        let end = start + (c.source_out - c.source_in);
+        if pt <= start || pt >= end {
+            return;
+        }
+        let src = c.source_in + (pt - start);
+        self.push_undo();
+        let tr = &mut self.project.video_tracks[track];
+        tr.clips[clip].source_out = src;
+        tr.clips.insert(
+            clip + 1,
+            VideoClip {
+                asset: c.asset,
+                source_in: src,
+                source_out: c.source_out,
+                timeline_start: pt,
+                opacity: c.opacity,
+                transform: c.transform,
+            },
+        );
+    }
+
+    fn split_audio(&mut self, track: usize, clip: usize) {
+        let pt = self.playhead_us;
+        let Some(c) = self.project.audio_tracks[track].clips.get(clip).cloned() else {
+            return;
+        };
+        let start = c.timeline_start;
+        let end = start + (c.source_out - c.source_in);
+        if pt <= start || pt >= end {
+            return;
+        }
+        let src = c.source_in + (pt - start);
+        self.push_undo();
+        let tr = &mut self.project.audio_tracks[track];
+        tr.clips[clip].source_out = src;
+        tr.clips.insert(
+            clip + 1,
+            AudioClip {
+                asset: c.asset,
+                source_in: src,
+                source_out: c.source_out,
+                timeline_start: pt,
+                gain_db: c.gain_db,
+                fade_in_us: c.fade_in_us,
+                fade_out_us: c.fade_out_us,
+            },
+        );
+        self.audio.refresh(&self.project);
+    }
+
+    // ── Export dialog ────────────────────────────────────────────────────────
     fn export_window(&mut self, ctx: &egui::Context) {
         let mut open = self.export_open;
         egui::Window::new("Export")
@@ -888,6 +1513,44 @@ impl FastCutterApp {
         self.export_open = open;
     }
 
+    // ── Keybinds dialog ──────────────────────────────────────────────────────
+    fn keybinds_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.keybinds_open;
+        egui::Window::new("Keybinds")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let kb = self.keybinds;
+                let rows = [
+                    ("Play / Pause", kb.play_pause),
+                    ("Step one frame back", kb.step_back),
+                    ("Step one frame forward", kb.step_fwd),
+                    ("Jump to start", kb.jump_start),
+                    ("Jump to end", kb.jump_end),
+                    ("Split clip at playhead", kb.split_clip),
+                    ("Delete selected clip", kb.delete_clip),
+                    ("Undo", kb.undo),
+                    ("Redo", kb.redo),
+                    ("Open / close export", kb.export_render),
+                    ("Add text clip", kb.add_text),
+                    ("Toggle audio peaks", kb.toggle_peaks),
+                    ("Add video track", kb.add_video_track),
+                    ("Add audio track", kb.add_audio_track),
+                    ("Close dialogs", kb.close_window),
+                ];
+                egui::Grid::new("keybinds_grid").num_columns(2).show(ui, |ui| {
+                    for (label, sc) in rows {
+                        ui.label(label);
+                        ui.strong(shortcut_label(sc));
+                        ui.end_row();
+                    }
+                });
+                ui.separator();
+                ui.label("Drag: click a clip in the Media panel and drop it onto a timeline track.");
+            });
+        self.keybinds_open = open;
+    }
+
     fn status_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -897,7 +1560,7 @@ impl FastCutterApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
-                        "{}×{} @{}fps   {} assets",
+                        "{}x{} @{}fps   {} assets",
                         self.project.width,
                         self.project.height,
                         self.project.fps,
@@ -914,6 +1577,31 @@ fn c_name(p: &Project, id: AssetId) -> String {
         .get(id)
         .map(|a| a.name.clone())
         .unwrap_or_else(|| "?".into())
+}
+
+fn shortcut_label(sc: KeyboardShortcut) -> String {
+    let mut parts = Vec::new();
+    if sc.modifiers.ctrl {
+        parts.push("Ctrl");
+    }
+    if sc.modifiers.shift {
+        parts.push("Shift");
+    }
+    if sc.modifiers.alt {
+        parts.push("Alt");
+    }
+    let key = match sc.logical_key {
+        Key::Space => "Space".to_string(),
+        Key::ArrowLeft => "Left".to_string(),
+        Key::ArrowRight => "Right".to_string(),
+        Key::Home => "Home".to_string(),
+        Key::End => "End".to_string(),
+        Key::Escape => "Esc".to_string(),
+        Key::Delete => "Delete".to_string(),
+        other => format!("{other:?}"),
+    };
+    parts.push(&key);
+    parts.join("+")
 }
 
 const WHITE: Color32 = Color32::from_rgb(236, 236, 240);
@@ -936,9 +1624,11 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.faint_bg_color = Color32::from_rgb(10, 10, 12);
     style.visuals.override_text_color = Some(WHITE);
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    style.spacing.button_padding = egui::vec2(8.0, 3.0);
     style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, WHITE);
     style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, WHITE);
     style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, WHITE);
     style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, WHITE);
+    style.visuals.selection.bg_fill = Color32::from_rgb(40, 80, 140);
     ctx.set_style(style);
 }
