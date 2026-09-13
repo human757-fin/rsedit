@@ -27,6 +27,12 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
     if is_image {
         let (w, h, rgba) =
             decoder::load_image_rgba(path).with_context(|| format!("import image {path}"))?;
+        let (tw, th) = fit_box(w, h, 96, 54);
+        let thumb = Some((
+            tw,
+            th,
+            decoder::scale_rgba(&rgba, w, h, tw, th),
+        ));
         let duration_us = crate::timeline::SECOND_US; // single held frame for clip duration
         return Ok(store.insert(Asset {
             id: AssetId(0),
@@ -41,6 +47,7 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
             channels: 1,
             peaks: vec![],
             rgba: Some(rgba),
+            thumb,
             pcm: None,
         }));
     }
@@ -81,6 +88,14 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
         }
     }
 
+    // First-frame thumbnail for video assets (aspect-preserving, max 96x54).
+    let thumb = if kind == AssetKind::Video && w > 0 && h > 0 {
+        let (tw, th) = fit_box(w, h, 96, 54);
+        decoder::video_thumbnail(path, tw, th).ok()
+    } else {
+        None
+    };
+
     Ok(store.insert(Asset {
         id: AssetId(0),
         kind,
@@ -94,6 +109,19 @@ pub fn import_media(store: &mut AssetStore, path: &str) -> Result<AssetId> {
         channels: audio_channels.max(1),
         peaks,
         rgba: None,
+        thumb,
         pcm,
     }))
+}
+
+/// Largest (tw, th) that fits inside the box while keeping `(w, h)` aspect.
+fn fit_box(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (max_w, max_h);
+    }
+    let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32).min(1.0);
+    (
+        ((w as f32 * scale).round()).max(1.0) as u32,
+        ((h as f32 * scale).round()).max(1.0) as u32,
+    )
 }

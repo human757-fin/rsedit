@@ -6,7 +6,9 @@
 //! foreground. Preferences (editable keybinds + global settings) are under
 //! File -> Preferences and Help -> Preferences.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, Rect, RichText, Sense, StrokeKind};
@@ -134,6 +136,7 @@ enum BindField {
 struct Settings {
     show_peaks: bool,
     dark_mode: bool,
+    snap_to_playhead: bool,
     preview_width: u32,
     preview_height: u32,
 }
@@ -143,6 +146,7 @@ impl Default for Settings {
         Self {
             show_peaks: true,
             dark_mode: true,
+            snap_to_playhead: true,
             preview_width: 1280,
             preview_height: 720,
         }
@@ -199,6 +203,8 @@ pub struct FastCutterApp {
     selected: Selection,
     // UI state
     media_tab: MediaTab,
+    media_filter: String,
+    thumbnails: HashMap<AssetId, egui::TextureHandle>,
     drag_source: Option<AssetId>,
     drag_timeline_us: Option<i64>,
     settings_open: bool,
@@ -212,7 +218,7 @@ pub struct FastCutterApp {
     export_h: u32,
     export_fps: f64,
     export_msg: Option<String>,
-    toasts: Vec<String>,
+    toasts: Vec<(String, Instant)>,
     // Undo / redo stacks
     undo_stack: Vec<Project>,
     redo_stack: Vec<Project>,
@@ -250,6 +256,8 @@ impl FastCutterApp {
             preview_rendered_pts: None,
             selected: Selection::None,
             media_tab: MediaTab::All,
+            media_filter: String::new(),
+            thumbnails: HashMap::new(),
             drag_source: None,
             drag_timeline_us: None,
             settings_open: false,
@@ -493,7 +501,10 @@ impl FastCutterApp {
         if let Some(sc) = combo {
             self.keybinds.set(field, sc);
             self.capturing = None;
-            self.toasts.push(format!("Bound {} to {}", bind_label(field), shortcut_label(sc)));
+            self.toasts.push((
+                format!("Bound {} to {}", bind_label(field), shortcut_label(sc)),
+                Instant::now(),
+            ));
         } else if cancel {
             self.capturing = None;
         }
@@ -562,12 +573,13 @@ impl eframe::App for FastCutterApp {
             self.compute_preview();
         }
 
-        // Panels.
+        // Panels. Timeline must be added first so it spans the whole bottom
+        // width and the side panels stop at its top edge.
         self.menu_bar(ctx);
         self.transport_bar(ctx);
+        self.timeline(ctx);
         self.media_panel(ctx);
         self.inspector(ctx);
-        self.timeline(ctx);
         self.preview_panel(ctx);
         if self.export_open {
             self.export_window(ctx);
@@ -575,7 +587,7 @@ impl eframe::App for FastCutterApp {
         if self.settings_open {
             self.settings_window(ctx);
         }
-        self.status_bar(ctx);
+        self.toast_overlay(ctx);
 
         // Clear a pending media drag when the pointer was released.
         if ctx.input(|i| i.pointer.any_released()) {
@@ -666,24 +678,6 @@ impl FastCutterApp {
                     {
                         ui.close_menu();
                         self.settings.show_peaks = !self.settings.show_peaks;
-                    }
-                });
-                ui.menu_button("View", |ui| {
-                    if ui
-                        .add(egui::Button::new("Preferences..."))
-                        .clicked()
-                    {
-                        ui.close_menu();
-                        self.settings_open = true;
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui
-                        .add(egui::Button::new("Preferences / Keybinds"))
-                        .clicked()
-                    {
-                        ui.close_menu();
-                        self.settings_open = true;
                     }
                 });
             });
@@ -806,7 +800,7 @@ impl FastCutterApp {
                 }
 
                 ui.add_space(4.0);
-                ui.separator();
+                ui.text_edit_singleline(&mut self.media_filter);
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new("Drag clips onto the timeline, or double-click to add.")
@@ -819,6 +813,29 @@ impl FastCutterApp {
                 let mut remove_id: Option<AssetId> = None;
                 let ids: Vec<AssetId> = self.project.assets.assets.keys().copied().collect();
                 let fps = self.project.fps;
+                let query = self.media_filter.trim().to_lowercase();
+
+                // Lazily upload thumbnails for any asset that has one cached.
+                {
+                    let ctx = ui.ctx().clone();
+                    let assets = &self.project.assets;
+                    for id in &ids {
+                        if self.thumbnails.contains_key(id) {
+                            continue;
+                        }
+                        if let Some((w, h, rgba)) =
+                            assets.get(*id).and_then(|a| a.thumb.clone())
+                        {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &rgba,
+                            );
+                            let tex = ctx
+                                .load_texture(format!("thumb_{}", id.0), img, egui::TextureOptions::LINEAR);
+                            self.thumbnails.insert(*id, tex);
+                        }
+                    }
+                }
 
                 egui::ScrollArea::vertical()
                     .max_height(ui.available_height())
@@ -837,6 +854,9 @@ impl FastCutterApp {
                             if !visible {
                                 continue;
                             }
+                            if !query.is_empty() && !a.name.to_lowercase().contains(&query) {
+                                continue;
+                            }
 
                             let (badge, bg) = match a.kind {
                                 AssetKind::Video => ("V", VIDEO_CLIP),
@@ -845,7 +865,7 @@ impl FastCutterApp {
                             };
 
                             let item_response = ui.allocate_response(
-                                egui::vec2(ui.available_width(), 30.0),
+                                egui::vec2(ui.available_width(), 42.0),
                                 Sense::click_and_drag(),
                             );
 
@@ -858,32 +878,81 @@ impl FastCutterApp {
                             ui.painter()
                                 .rect_filled(item_response.rect, 3.0, bg_col);
 
-                            // Badge.
-                            let badge_rect = Rect::from_min_size(
-                                item_response.rect.min + egui::vec2(4.0, 5.0),
-                                egui::vec2(20.0, 20.0),
+                            // Thumbnail or badge on the left.
+                            let thumb_rect = Rect::from_min_size(
+                                item_response.rect.min + egui::vec2(3.0, 5.0),
+                                egui::vec2(56.0, 32.0),
                             );
-                            ui.painter().rect_filled(badge_rect, 3.0, bg);
-                            ui.painter().text(
-                                badge_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                badge,
-                                egui::FontId::proportional(10.0),
-                                Color32::from_rgb(230, 230, 235),
-                            );
+                            if let Some(tex) = self.thumbnails.get(&id) {
+                                ui.painter().rect_filled(
+                                    thumb_rect,
+                                    2.0,
+                                    Color32::from_rgb(0, 0, 0),
+                                );
+                                ui.painter().image(
+                                    tex.id(),
+                                    thumb_rect.shrink(1.0),
+                                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter().rect_filled(thumb_rect, 3.0, bg);
+                                ui.painter().text(
+                                    thumb_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    badge,
+                                    egui::FontId::proportional(11.0),
+                                    Color32::from_rgb(230, 230, 235),
+                                );
+                            }
 
-                            // Name + duration.
+                            // Name + duration (right of thumbnail).
                             ui.painter().text(
-                                item_response.rect.min + egui::vec2(30.0, 9.0),
-                                egui::Align2::LEFT_CENTER,
-                                format!(
-                                    "{}  [{}]",
-                                    a.name,
-                                    timecode_string(a.duration_us, fps)
-                                ),
+                                item_response.rect.min + egui::vec2(68.0, 6.0),
+                                egui::Align2::LEFT_TOP,
+                                &a.name,
                                 egui::FontId::proportional(11.0),
                                 WHITE,
                             );
+                            ui.painter().text(
+                                item_response.rect.min + egui::vec2(68.0, 22.0),
+                                egui::Align2::LEFT_TOP,
+                                timecode_string(a.duration_us, fps),
+                                egui::FontId::proportional(9.0),
+                                Color32::from_rgb(150, 150, 160),
+                            );
+
+                            // Mini waveform preview for audio (right side).
+                            if a.kind == AssetKind::Audio && !a.peaks.is_empty() {
+                                let wf = Rect::from_min_max(
+                                    egui::pos2(item_response.rect.right() - 130.0, item_response.rect.min.y + 8.0),
+                                    egui::pos2(item_response.rect.right() - 6.0, item_response.rect.max.y - 8.0),
+                                );
+                                ui.painter().rect_filled(wf, 2.0, TRACK);
+                                let mid = wf.center().y;
+                                let half = wf.height() * 0.5;
+                                let n = a.peaks.len();
+                                let step = (n as f32 / wf.width()).ceil().max(1.0) as usize;
+                                let mut i = 0usize;
+                                let mut px = wf.min.x;
+                                while px < wf.max.x {
+                                    let mut max = 0.0f32;
+                                    let mut min = 0.0f32;
+                                    for _ in 0..step {
+                                        if i < n {
+                                            let (lo, hi) = a.peaks[i];
+                                            max = max.max(hi);
+                                            min = min.min(lo);
+                                        }
+                                        i += 1;
+                                    }
+                                    ui.painter().line_segment(
+                                        [egui::pos2(px, mid - max * half), egui::pos2(px, mid - min * half)],
+                                        egui::Stroke::new(1.0, WAVE),
+                                    );
+                                    px += 1.0;
+                                }
+                            }
 
                             // Drag from media -> timeline.
                             if item_response.dragged() {
@@ -918,6 +987,9 @@ impl FastCutterApp {
                     self.push_undo();
                     self.remove_asset(id);
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("{} assets", self.project.assets.len()));
+                });
             });
     }
 
@@ -1218,8 +1290,14 @@ impl FastCutterApp {
                         }
                     }
                     if ctx.input(|i| i.pointer.any_released()) {
-                        let drop_us =
+                        let mut drop_us =
                             self.drag_timeline_us.unwrap_or(self.project.duration_us());
+                        // Snap to the playhead when close (150ms window).
+                        if self.settings.snap_to_playhead
+                            && (drop_us - self.playhead_us).abs() < 150_000
+                        {
+                            drop_us = self.playhead_us;
+                        }
                         if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
                             if rect.contains(p) {
                                 // Find lane under the pointer.
@@ -1264,17 +1342,29 @@ impl FastCutterApp {
         let path_s = path.to_string_lossy().into_owned();
         match crate::assets::import_media(&mut self.project.assets, &path_s) {
             Ok(id) => {
+                // Auto-adjust the project frame rate to the source video.
+                let mut tag = String::new();
+                if let Some(a) = self.project.assets.get(id) {
+                    if a.kind == AssetKind::Video && a.frame_rate > 0.0 {
+                        self.project.fps = a.frame_rate;
+                        tag = format!(" at {:.2} fps", a.frame_rate);
+                    }
+                }
                 self.audio.refresh(&self.project);
-                self.toasts.push(format!(
-                    "Imported {}",
-                    self.project
-                        .assets
-                        .get(id)
-                        .map(|a| a.name.clone())
-                        .unwrap_or_default()
+                self.toasts.push((
+                    format!(
+                        "Imported {}{}",
+                        self.project
+                            .assets
+                            .get(id)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_default(),
+                        tag
+                    ),
+                    Instant::now(),
                 ));
             }
-            Err(e) => self.toasts.push(format!("Import failed: {e}")),
+            Err(e) => self.toasts.push((format!("Import failed: {e}"), Instant::now())),
         }
     }
 
@@ -1290,10 +1380,11 @@ impl FastCutterApp {
             .iter()
             .any(|t| t.clips.iter().any(|c| c.asset == id));
         if used_video || used_audio {
-            self.toasts.push("Remove clips first".into());
+            self.toasts.push(("Remove clips first".into(), Instant::now()));
             return;
         }
         self.project.assets.assets.remove(&id);
+        self.thumbnails.remove(&id);
         self.audio.refresh(&self.project);
     }
 
@@ -1739,6 +1830,10 @@ impl FastCutterApp {
                 ui.heading("Application");
                 ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
                 ui.checkbox(&mut self.settings.show_peaks, "Show audio peaks in the timeline");
+                ui.checkbox(
+                    &mut self.settings.snap_to_playhead,
+                    "Snap media drops to the playhead",
+                );
                 ui.horizontal(|ui| {
                     ui.label("Preview render size");
                     ui.add(
@@ -1760,37 +1855,43 @@ impl FastCutterApp {
         if reset_binds {
             self.keybinds.reset();
             self.capturing = None;
-            self.toasts.push("Keybinds reset to defaults".into());
+            self.toasts.push(("Keybinds reset to defaults".into(), Instant::now()));
         }
         if prev_dark != self.settings.dark_mode {
             apply_theme(ctx, self.settings.dark_mode);
-            self.toasts.push(if self.settings.dark_mode {
-                "Dark mode enabled".into()
-            } else {
-                "Light mode enabled".into()
-            });
+            self.toasts.push((
+                if self.settings.dark_mode {
+                    "Dark mode enabled".into()
+                } else {
+                    "Light mode enabled".into()
+                },
+                Instant::now(),
+            ));
         }
         self.settings_open = open && !request_close;
     }
 
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if !self.toasts.is_empty() {
-                    let t = self.toasts.remove(0);
-                    ui.colored_label(Color32::from_rgb(120, 220, 160), t);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!(
-                        "{}x{} @{}fps   {} assets",
-                        self.project.width,
-                        self.project.height,
-                        self.project.fps,
-                        self.project.assets.len()
-                    ));
-                });
+    // ── Toast overlay (top-right, auto-fading) ──────────────────────────────
+    fn toast_overlay(&mut self, ctx: &egui::Context) {
+        self.toasts
+            .retain(|(_, t)| t.elapsed() < Duration::from_secs(3));
+        if self.toasts.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::new("toasts_area"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 44.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::window(ui.style())
+                    .fill(PANEL)
+                    .stroke(egui::Stroke::new(1.0, TRACK))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .show(ui, |ui| {
+                        for (msg, _) in &self.toasts {
+                            ui.colored_label(Color32::from_rgb(120, 220, 160), msg);
+                        }
+                    });
             });
-        });
     }
 }
 

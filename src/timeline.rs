@@ -44,6 +44,10 @@ pub struct Asset {
     /// For Image assets: decoded RGBA8 pixels, kept in memory.
     #[serde(skip)]
     pub rgba: Option<Vec<u8>>,
+    /// Small RGBA8 thumbnail (w, h, pixels). Video = first decoded frame;
+    /// image = downscaled source; audio = none.
+    #[serde(skip)]
+    pub thumb: Option<(u32, u32, Vec<u8>)>,
     /// For Audio assets: fully decoded interleaved f32 PCM at project rate.
     #[serde(skip)]
     pub pcm: Option<Vec<f32>>,
@@ -376,6 +380,7 @@ mod tests {
             channels: 2,
             peaks: vec![],
             rgba: None,
+            thumb: None,
             pcm: None,
         });
         p.video_tracks[0].clips.push(VideoClip {

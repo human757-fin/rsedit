@@ -316,3 +316,58 @@ pub fn load_image_rgba(path: &str) -> Result<(u32, u32, Vec<u8>)> {
     let rgba = img.to_rgba8();
     Ok((rgba.width(), rgba.height(), rgba.into_raw()))
 }
+
+/// Decode one (near-instant, aspect-squashed to `tw`x`th`) thumbnail frame.
+/// Returns (w, h, rgba8). `None` when the file has no decodable first frame.
+pub fn video_thumbnail(path: &str, tw: u32, th: u32) -> Result<(u32, u32, Vec<u8>)> {
+    let mut src = VideoSource::open(path, tw.max(1), th.max(1))?;
+    match src.frame_at(0) {
+        Ok(Some(f)) => {
+            let w = f.width.max(1);
+            let h = f.height.max(1);
+            let n = w as usize * h as usize * 4;
+            Ok((w, h, f.rgba[..n.min(f.rgba.len())].to_vec()))
+        }
+        Ok(None) => bail!("no decodable frame in {path}"),
+        Err(e) => Err(e),
+    }
+}
+
+/// Bilinear downsample of an RGBA8 image into `tw`x`th` (keeps caller's box).
+pub fn scale_rgba(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    let (w, h, tw, th) = (w.max(1), h.max(1), tw.max(1), th.max(1));
+    let sx = w as f32 / tw as f32;
+    let sy = h as f32 / th as f32;
+    let mut out = vec![0u8; (tw as usize) * (th as usize) * 4];
+    for y in 0..th {
+        for x in 0..tw {
+            let src_x = (x as f32 + 0.5) * sx - 0.5;
+            let src_y = (y as f32 + 0.5) * sy - 0.5;
+            let x0 = src_x.max(0.0) as u32;
+            let y0 = src_y.max(0.0) as u32;
+            let x1 = (x0 + 1).min(w - 1);
+            let y1 = (y0 + 1).min(h - 1);
+            let fx = (src_x - x0 as f32).clamp(0.0, 1.0);
+            let fy = (src_y - y0 as f32).clamp(0.0, 1.0);
+            let at = |u: u32, v: u32| -> [f32; 4] {
+                let i = ((v * w + u) * 4) as usize;
+                [
+                    rgba.get(i).copied().unwrap_or(0) as f32,
+                    rgba.get(i + 1).copied().unwrap_or(0) as f32,
+                    rgba.get(i + 2).copied().unwrap_or(0) as f32,
+                    rgba.get(i + 3).copied().unwrap_or(0) as f32,
+                ]
+            };
+            let tl = at(x0, y0);
+            let tr = at(x1, y0);
+            let bl = at(x0, y1);
+            let br = at(x1, y1);
+            let lerp = |a: f32, b: f32, c: f32, d: f32| (a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy).clamp(0.0, 255.0);
+            let o = ((y * tw + x) * 4) as usize;
+            for c in 0..4 {
+                out[o + c] = lerp(tl[c], tr[c], bl[c], br[c]) as u8;
+            }
+        }
+    }
+    out
+}
