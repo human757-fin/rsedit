@@ -3,7 +3,8 @@
 //! Layout: top menu bar + transport bar, left media panel (tabbed, with
 //! drag-and-drop), center preview viewport, right clip inspector, bottom
 //! multi-track timeline. Theme is near-black (#08080a) with near-white
-//! foreground.
+//! foreground. Preferences (editable keybinds + global settings) are under
+//! File -> Preferences and Help -> Preferences.
 
 use std::path::PathBuf;
 
@@ -17,9 +18,6 @@ use crate::timeline::{
     AssetId, AssetKind, AudioClip, Project, TextAlign, TextClip, TextStyle, Timecode, Track,
     Transform, VideoClip, SECOND_US,
 };
-
-const PREVIEW_W: u32 = 1280;
-const PREVIEW_H: u32 = 720;
 
 // ── Keyboard shortcuts ───────────────────────────────────────────────────────
 
@@ -64,6 +62,120 @@ impl Default for Keybinds {
     }
 }
 
+impl Keybinds {
+    fn get(&self, f: BindField) -> KeyboardShortcut {
+        match f {
+            BindField::PlayPause => self.play_pause,
+            BindField::StepBack => self.step_back,
+            BindField::StepFwd => self.step_fwd,
+            BindField::JumpStart => self.jump_start,
+            BindField::JumpEnd => self.jump_end,
+            BindField::SplitClip => self.split_clip,
+            BindField::DeleteClip => self.delete_clip,
+            BindField::Undo => self.undo,
+            BindField::Redo => self.redo,
+            BindField::ExportRender => self.export_render,
+            BindField::AddText => self.add_text,
+            BindField::TogglePeaks => self.toggle_peaks,
+            BindField::AddVideoTrack => self.add_video_track,
+            BindField::AddAudioTrack => self.add_audio_track,
+            BindField::CloseWindow => self.close_window,
+        }
+    }
+
+    fn set(&mut self, f: BindField, sc: KeyboardShortcut) {
+        match f {
+            BindField::PlayPause => self.play_pause = sc,
+            BindField::StepBack => self.step_back = sc,
+            BindField::StepFwd => self.step_fwd = sc,
+            BindField::JumpStart => self.jump_start = sc,
+            BindField::JumpEnd => self.jump_end = sc,
+            BindField::SplitClip => self.split_clip = sc,
+            BindField::DeleteClip => self.delete_clip = sc,
+            BindField::Undo => self.undo = sc,
+            BindField::Redo => self.redo = sc,
+            BindField::ExportRender => self.export_render = sc,
+            BindField::AddText => self.add_text = sc,
+            BindField::TogglePeaks => self.toggle_peaks = sc,
+            BindField::AddVideoTrack => self.add_video_track = sc,
+            BindField::AddAudioTrack => self.add_audio_track = sc,
+            BindField::CloseWindow => self.close_window = sc,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+enum BindField {
+    PlayPause,
+    StepBack,
+    StepFwd,
+    JumpStart,
+    JumpEnd,
+    SplitClip,
+    DeleteClip,
+    Undo,
+    Redo,
+    ExportRender,
+    AddText,
+    TogglePeaks,
+    AddVideoTrack,
+    AddAudioTrack,
+    CloseWindow,
+}
+
+// ── Global application settings ──────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct Settings {
+    show_peaks: bool,
+    dark_mode: bool,
+    preview_width: u32,
+    preview_height: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            show_peaks: true,
+            dark_mode: true,
+            preview_width: 1280,
+            preview_height: 720,
+        }
+    }
+}
+
+const BIND_ROWS: [(&str, BindField); 15] = [
+    ("Play / Pause", BindField::PlayPause),
+    ("Step one frame back", BindField::StepBack),
+    ("Step one frame forward", BindField::StepFwd),
+    ("Jump to start", BindField::JumpStart),
+    ("Jump to end", BindField::JumpEnd),
+    ("Split clip at playhead", BindField::SplitClip),
+    ("Delete selected clip", BindField::DeleteClip),
+    ("Undo", BindField::Undo),
+    ("Redo", BindField::Redo),
+    ("Open / close export", BindField::ExportRender),
+    ("Add text clip", BindField::AddText),
+    ("Toggle audio peaks", BindField::TogglePeaks),
+    ("Add video track", BindField::AddVideoTrack),
+    ("Add audio track", BindField::AddAudioTrack),
+    ("Close dialogs", BindField::CloseWindow),
+];
+
+fn bind_label(f: BindField) -> &'static str {
+    for (label, bf) in BIND_ROWS {
+        if bf == f {
+            return label;
+        }
+    }
+    "?"
+}
+
 // ── Media panel tab ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +201,10 @@ pub struct FastCutterApp {
     media_tab: MediaTab,
     drag_source: Option<AssetId>,
     drag_timeline_us: Option<i64>,
-    keybinds_open: bool,
+    settings_open: bool,
+    capturing: Option<BindField>,
     keybinds: Keybinds,
+    settings: Settings,
     // Export dialog
     export_open: bool,
     export_path: String,
@@ -98,7 +212,6 @@ pub struct FastCutterApp {
     export_h: u32,
     export_fps: f64,
     export_msg: Option<String>,
-    show_peaks: bool,
     toasts: Vec<String>,
     // Undo / redo stacks
     undo_stack: Vec<Project>,
@@ -122,7 +235,7 @@ impl Default for Selection {
 impl FastCutterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         ensure_ffmpeg();
-        apply_theme(&cc.egui_ctx);
+        apply_theme(&cc.egui_ctx, true);
         let project = Project::new();
         let audio = AudioEngine::new(&project);
         let cache = FrameCache::new();
@@ -139,15 +252,16 @@ impl FastCutterApp {
             media_tab: MediaTab::All,
             drag_source: None,
             drag_timeline_us: None,
-            keybinds_open: false,
+            settings_open: false,
+            capturing: None,
             keybinds: Keybinds::default(),
+            settings: Settings::default(),
             export_open: false,
             export_path: "out.mp4".into(),
             export_w: 1920,
             export_h: 1080,
             export_fps: 30.0,
             export_msg: None,
-            show_peaks: true,
             toasts: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -183,8 +297,8 @@ impl FastCutterApp {
     fn compute_preview(&mut self) {
         let dur = self.project.duration_us().max(SECOND_US);
         let pts = self.playhead_us.min(dur);
-        let w = PREVIEW_W;
-        let h = PREVIEW_H;
+        let w = self.settings.preview_width;
+        let h = self.settings.preview_height;
         if let Some(tex) = self.preview_texture.as_mut() {
             let rgba = crate::render::Composition {
                 project: &self.project,
@@ -212,8 +326,8 @@ impl FastCutterApp {
                     self.cache.set_target(FrameRequest {
                         asset: asset.id.0,
                         path: asset.path.clone(),
-                        w: PREVIEW_W,
-                        h: PREVIEW_H,
+                        w: self.settings.preview_width,
+                        h: self.settings.preview_height,
                         pts_us: pts,
                     });
                     self.last_request = Some(key);
@@ -303,6 +417,9 @@ impl FastCutterApp {
     }
 
     fn handle_keybinds(&mut self, ctx: &egui::Context) {
+        if self.capturing.is_some() {
+            return;
+        }
         let kb = self.keybinds;
         ctx.input_mut(|i| {
             // Most-specific shortcuts first (redo before undo).
@@ -335,16 +452,51 @@ impl FastCutterApp {
             } else if i.consume_shortcut(&kb.add_text) {
                 self.add_text_clip();
             } else if i.consume_shortcut(&kb.toggle_peaks) {
-                self.show_peaks = !self.show_peaks;
+                self.settings.show_peaks = !self.settings.show_peaks;
             } else if i.consume_shortcut(&kb.add_video_track) {
                 self.add_track(0);
             } else if i.consume_shortcut(&kb.add_audio_track) {
                 self.add_track(1);
             } else if i.consume_shortcut(&kb.close_window) {
                 self.export_open = false;
-                self.keybinds_open = false;
+                self.settings_open = false;
             }
         });
+    }
+
+    fn handle_capture(&mut self, ctx: &egui::Context) {
+        let Some(field) = self.capturing else {
+            return;
+        };
+        let (combo, cancel) = ctx.input(|i| {
+            let mut combo: Option<KeyboardShortcut> = None;
+            let mut cancel = false;
+            for ev in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    if *pressed {
+                        if *key == Key::Escape {
+                            cancel = true;
+                        } else {
+                            combo = Some(KeyboardShortcut::new(*modifiers, *key));
+                        }
+                    }
+                }
+            }
+            (combo, cancel)
+        });
+        if let Some(sc) = combo {
+            self.keybinds.set(field, sc);
+            self.capturing = None;
+            self.toasts.push(format!("Bound {} to {}", bind_label(field), shortcut_label(sc)));
+        } else if cancel {
+            self.capturing = None;
+        }
     }
 }
 
@@ -381,6 +533,8 @@ impl eframe::App for FastCutterApp {
 
         // Keyboard shortcuts.
         self.handle_keybinds(ctx);
+        // Rebind capture (only active while the Preferences window is capturing).
+        self.handle_capture(ctx);
 
         // Files dropped onto the window (from the OS file manager).
         let dropped: Vec<PathBuf> = ctx
@@ -391,7 +545,10 @@ impl eframe::App for FastCutterApp {
 
         self.request_frame();
         if self.preview_texture.is_none() {
-            let size = [PREVIEW_W as usize, PREVIEW_H as usize];
+            let size = [
+                self.settings.preview_width as usize,
+                self.settings.preview_height as usize,
+            ];
             let s = ctx.load_texture(
                 "preview",
                 egui::ColorImage::new(size, Color32::from_rgb(8, 8, 10)),
@@ -415,8 +572,8 @@ impl eframe::App for FastCutterApp {
         if self.export_open {
             self.export_window(ctx);
         }
-        if self.keybinds_open {
-            self.keybinds_window(ctx);
+        if self.settings_open {
+            self.settings_window(ctx);
         }
         self.status_bar(ctx);
 
@@ -449,6 +606,14 @@ impl FastCutterApp {
                     if ui.add(egui::Button::new("Export...").shortcut_text("Ctrl+E")).clicked() {
                         ui.close_menu();
                         self.export_open = true;
+                    }
+                    ui.separator();
+                    if ui
+                        .add(egui::Button::new("Preferences..."))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.settings_open = true;
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -500,13 +665,25 @@ impl FastCutterApp {
                         .clicked()
                     {
                         ui.close_menu();
-                        self.show_peaks = !self.show_peaks;
+                        self.settings.show_peaks = !self.settings.show_peaks;
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui
+                        .add(egui::Button::new("Preferences..."))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.settings_open = true;
                     }
                 });
                 ui.menu_button("Help", |ui| {
-                    if ui.add(egui::Button::new("Keybinds").shortcut_text("?")) .clicked() {
+                    if ui
+                        .add(egui::Button::new("Preferences / Keybinds"))
+                        .clicked()
+                    {
                         ui.close_menu();
-                        self.keybinds_open = true;
+                        self.settings_open = true;
                     }
                 });
             });
@@ -731,7 +908,7 @@ impl FastCutterApp {
 
                 ui.add_space(2.0);
                 ui.separator();
-                ui.checkbox(&mut self.show_peaks, "Show audio peaks");
+                ui.checkbox(&mut self.settings.show_peaks, "Show audio peaks");
 
                 if let Some(id) = add_id {
                     self.push_undo();
@@ -749,7 +926,7 @@ impl FastCutterApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(tex) = &self.preview_texture {
                 let avail = ui.available_size();
-                let aspect = PREVIEW_W as f32 / PREVIEW_H as f32;
+                let aspect = self.settings.preview_width as f32 / self.settings.preview_height as f32;
                 let mut size = avail;
                 if size.x / size.y > aspect {
                     size.x = size.y * aspect;
@@ -919,7 +1096,7 @@ impl FastCutterApp {
                         );
                         painter.rect_filled(cr, 2.0, AUDIO_CLIP);
                         if let Some(asset) = self.project.assets.get(c.asset) {
-                            if self.show_peaks && !asset.peaks.is_empty() {
+                            if self.settings.show_peaks && !asset.peaks.is_empty() {
                                 let pw = cr.width();
                                 let ph = cr.height();
                                 let n = asset.peaks.len();
@@ -1513,42 +1690,87 @@ impl FastCutterApp {
         self.export_open = open;
     }
 
-    // ── Keybinds dialog ──────────────────────────────────────────────────────
-    fn keybinds_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.keybinds_open;
-        egui::Window::new("Keybinds")
+    // ── Preferences dialog (editable keybinds + global settings) ─────────────
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        let prev_dark = self.settings.dark_mode;
+        let mut reset_binds = false;
+        let mut request_close = false;
+        egui::Window::new("Preferences")
             .open(&mut open)
             .collapsible(false)
+            .default_width(480.0)
             .show(ctx, |ui| {
-                let kb = self.keybinds;
-                let rows = [
-                    ("Play / Pause", kb.play_pause),
-                    ("Step one frame back", kb.step_back),
-                    ("Step one frame forward", kb.step_fwd),
-                    ("Jump to start", kb.jump_start),
-                    ("Jump to end", kb.jump_end),
-                    ("Split clip at playhead", kb.split_clip),
-                    ("Delete selected clip", kb.delete_clip),
-                    ("Undo", kb.undo),
-                    ("Redo", kb.redo),
-                    ("Open / close export", kb.export_render),
-                    ("Add text clip", kb.add_text),
-                    ("Toggle audio peaks", kb.toggle_peaks),
-                    ("Add video track", kb.add_video_track),
-                    ("Add audio track", kb.add_audio_track),
-                    ("Close dialogs", kb.close_window),
-                ];
-                egui::Grid::new("keybinds_grid").num_columns(2).show(ui, |ui| {
-                    for (label, sc) in rows {
-                        ui.label(label);
-                        ui.strong(shortcut_label(sc));
-                        ui.end_row();
+                ui.heading("Keyboard shortcuts");
+                ui.label("Click a shortcut, then press the new keys (Esc to cancel).");
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        egui::Grid::new("settings_binds")
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for (label, f) in BIND_ROWS {
+                                    ui.label(label);
+                                    let capturing = self.capturing == Some(f);
+                                    let text = if capturing {
+                                        "press keys…".to_string()
+                                    } else {
+                                        shortcut_label(self.keybinds.get(f))
+                                    };
+                                    let btn = egui::Button::new(text).min_size(egui::vec2(150.0, 22.0));
+                                    if ui.add(btn).clicked() {
+                                        self.capturing = Some(f);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("Reset keybinds").clicked() {
+                        reset_binds = true;
+                    }
+                    if self.capturing.is_some() && ui.button("Cancel capture").clicked() {
+                        self.capturing = None;
                     }
                 });
                 ui.separator();
-                ui.label("Drag: click a clip in the Media panel and drop it onto a timeline track.");
+                ui.heading("Application");
+                ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
+                ui.checkbox(&mut self.settings.show_peaks, "Show audio peaks in the timeline");
+                ui.horizontal(|ui| {
+                    ui.label("Preview render size");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.preview_width)
+                            .range(320..=4096)
+                            .speed(2),
+                    );
+                    ui.label("x");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.preview_height)
+                            .range(180..=4096)
+                            .speed(2),
+                    );
+                });
+                ui.label("Applied on the next rendered frame.");
+                ui.separator();
+                request_close = ui.button("Close").clicked();
             });
-        self.keybinds_open = open;
+        if reset_binds {
+            self.keybinds.reset();
+            self.capturing = None;
+            self.toasts.push("Keybinds reset to defaults".into());
+        }
+        if prev_dark != self.settings.dark_mode {
+            apply_theme(ctx, self.settings.dark_mode);
+            self.toasts.push(if self.settings.dark_mode {
+                "Dark mode enabled".into()
+            } else {
+                "Light mode enabled".into()
+            });
+        }
+        self.settings_open = open && !request_close;
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
@@ -1615,20 +1837,34 @@ const TEXT_CLIP: Color32 = Color32::from_rgb(120, 90, 150);
 const WAVE: Color32 = Color32::from_rgb(120, 220, 170);
 const PLAYHEAD: Color32 = Color32::from_rgb(255, 80, 80);
 
-fn apply_theme(ctx: &egui::Context) {
+fn apply_theme(ctx: &egui::Context, dark: bool) {
     let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = PANEL;
-    style.visuals.window_fill = PANEL;
-    style.visuals.extreme_bg_color = TRACK;
-    style.visuals.faint_bg_color = Color32::from_rgb(10, 10, 12);
-    style.visuals.override_text_color = Some(WHITE);
+    style.visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    if dark {
+        style.visuals.panel_fill = PANEL;
+        style.visuals.window_fill = PANEL;
+        style.visuals.extreme_bg_color = TRACK;
+        style.visuals.faint_bg_color = Color32::from_rgb(10, 10, 12);
+        style.visuals.override_text_color = Some(WHITE);
+        style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, WHITE);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, WHITE);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, WHITE);
+        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, WHITE);
+        style.visuals.selection.bg_fill = Color32::from_rgb(40, 80, 140);
+    } else {
+        let fg = Color32::from_rgb(20, 20, 26);
+        style.visuals.panel_fill = Color32::from_rgb(243, 243, 248);
+        style.visuals.window_fill = Color32::from_rgb(250, 250, 252);
+        style.visuals.extreme_bg_color = Color32::from_rgb(226, 226, 234);
+        style.visuals.faint_bg_color = Color32::from_rgb(236, 236, 242);
+        style.visuals.override_text_color = Some(fg);
+        style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, fg);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, fg);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, fg);
+        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, fg);
+        style.visuals.selection.bg_fill = Color32::from_rgb(160, 200, 255);
+    }
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     style.spacing.button_padding = egui::vec2(8.0, 3.0);
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, WHITE);
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, WHITE);
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, WHITE);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, WHITE);
-    style.visuals.selection.bg_fill = Color32::from_rgb(40, 80, 140);
     ctx.set_style(style);
 }
