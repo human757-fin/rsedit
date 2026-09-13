@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Fast Cutter
+Name=rsedit
 Comment=A minimal, fast, cross-platform video editor
-Exec=fast-cutter
-Icon=fast-cutter
+Exec=rsedit
+Icon=rsedit
 Terminal=false
 Categories=AudioVideo;Video;AudioVideoEditing;
 Keywords=video;editor;cut;timeline;film;

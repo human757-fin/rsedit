@@ -1,4 +1,4 @@
-//! Fast Cutter Installer — a small GUI that fetches the latest official
+//! rsedit Installer — a small GUI that fetches the latest official
 //! portable build from this repository's GitHub Releases and installs it
 //! for the current user only (no admin, no per-machine writes).
 //!
@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-const APP_NAME: &str = "Fast Cutter";
+const APP_NAME: &str = "rsedit";
 const OWNER: &str = "human757-fin";
 const REPO: &str = "rsedit";
 const GITHUB_API: &str = "https://api.github.com";
-const UA: &str = "fast-cutter-installer/0.1";
+const UA: &str = "rsedit-installer/0.1";
 
 const BG: egui::Color32 = egui::Color32::from_rgb(12, 12, 14);
 const CARD: egui::Color32 = egui::Color32::from_rgb(18, 18, 22);
@@ -63,22 +63,22 @@ fn default_dir() -> PathBuf {
     #[cfg(windows)]
     {
         let base = env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into());
-        PathBuf::from(base).join("Programs").join("FastCutter")
+        PathBuf::from(base).join("Programs").join("rsedit")
     }
     #[cfg(not(windows))]
     {
-        home().join(".local").join("share").join("FastCutter")
+        home().join(".local").join("share").join("rsedit")
     }
 }
 
 fn exe_name() -> &'static str {
     #[cfg(windows)]
     {
-        "FastCutter.exe"
+        "rsedit.exe"
     }
     #[cfg(not(windows))]
     {
-        "FastCutter"
+        "rsedit"
     }
 }
 
@@ -156,7 +156,7 @@ fn desktop_dir() -> PathBuf {
 
 // Embedded app icon (small PNG shipped with the portable build).
 #[cfg(not(windows))]
-const ICON_PNG: &[u8] = include_bytes!("../../packaging/fast-cutter.png");
+const ICON_PNG: &[u8] = include_bytes!("../../packaging/rsedit.png");
 
 // Shortcut locations ---------------------------------------------------------
 
@@ -171,27 +171,27 @@ fn start_menu_lnk() -> Result<PathBuf, String> {
         .join("Windows")
         .join("Start Menu")
         .join("Programs")
-        .join("Fast Cutter.lnk"))
+        .join("rsedit.lnk"))
 }
 
 #[cfg(not(windows))]
 fn app_menu_file() -> PathBuf {
-    data_home().join("applications").join("fast-cutter.desktop")
+    data_home().join("applications").join("rsedit.desktop")
 }
 
 #[cfg(windows)]
 fn desktop_lnk() -> Result<PathBuf, String> {
-    Ok(desktop_folder()?.join("Fast Cutter.lnk"))
+    Ok(desktop_folder()?.join("rsedit.lnk"))
 }
 
 fn desktop_shortcut_file() -> PathBuf {
     #[cfg(windows)]
     {
-        desktop_lnk().unwrap_or_else(|_| home().join("Desktop").join("Fast Cutter.lnk"))
+        desktop_lnk().unwrap_or_else(|_| home().join("Desktop").join("rsedit.lnk"))
     }
     #[cfg(not(windows))]
     {
-        desktop_dir().join("FastCutter.desktop")
+        desktop_dir().join("rsedit.desktop")
     }
 }
 
@@ -349,7 +349,7 @@ fn write_start_menu(dir: &Path) -> Result<(), String> {
          $lnk.TargetPath = {};\n\
          $lnk.WorkingDirectory = {};\n\
          $lnk.IconLocation = {};\n\
-         $lnk.Description = 'Fast Cutter video editor';\n\
+         $lnk.Description = 'rsedit video editor';\n\
          $lnk.Save();",
         ps_quote(&lnk.display().to_string()),
         ps_quote(&target.display().to_string()),
@@ -372,7 +372,7 @@ fn write_start_menu(dir: &Path) -> Result<(), String> {
 #[cfg(windows)]
 fn write_desktop(dir: &Path) -> Result<(), String> {
     let target = dir.join(exe_name());
-    let lnk = desktop_folder()?.join("Fast Cutter.lnk");
+    let lnk = desktop_folder()?.join("rsedit.lnk");
     let script = format!(
         "$ws = New-Object -ComObject WScript.Shell;\n\
          $lnk = $ws.CreateShortcut({});\n\
@@ -395,7 +395,7 @@ fn write_desktop(dir: &Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn write_desktop(dir: &Path) -> Result<(), String> {
     let entry = desktop_entry_body(dir, &dir.join("icon.png"));
-    let file = desktop_dir().join("FastCutter.desktop");
+    let file = desktop_dir().join("rsedit.desktop");
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent).ok();
     }
@@ -413,7 +413,7 @@ fn desktop_entry_body(dir: &Path, icon: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=Fast Cutter\n\
+         Name=rsedit\n\
          Comment=A minimal, fast, cross-platform video editor\n\
          Exec={}\n\
          Icon={}\n\
@@ -445,7 +445,7 @@ fn remove_install(dir: &Path) -> Result<(), String> {
     if let Ok(uninstall) = hkcu
         .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
     {
-        let _ = uninstall.delete_subkey_all("FastCutter");
+        let _ = uninstall.delete_subkey_all("rsedit");
     }
     Ok(())
 }
@@ -465,7 +465,7 @@ fn register_uninstall(dir: &Path, current_exe: &Path) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
-    let uninstall_key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FastCutter";
+    let uninstall_key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\rsedit";
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
         .create_subkey(uninstall_key)
         .map_err(|e| format!("registry: {e}"))?;
@@ -557,7 +557,7 @@ fn run_install(sh: Shared, opts: Options) {
     };
     log_line(&sh, format!("Found {} ({} MiB)", asset.name, asset.size / (1024 * 1024)));
 
-    let tmp = env::temp_dir().join(format!("fastcutter-{}.inst", release.tag_name));
+    let tmp = env::temp_dir().join(format!("rsedit-{}.inst", release.tag_name));
     let _ = fs::remove_file(&tmp);
 
     log_line(&sh, "Downloading portable build…");
@@ -634,7 +634,7 @@ fn run_uninstall(sh: Shared, dir: PathBuf) {
     log_line(&sh, format!("Removing {}…", dir.display()));
     match remove_install(&dir) {
         Ok(()) => {
-            log_line(&sh, "Fast Cutter removed.");
+            log_line(&sh, "rsedit removed.");
             set_phase(&sh, Phase::Removed);
         }
         Err(e) => {
@@ -764,7 +764,7 @@ impl eframe::App for InstallerApp {
                     );
                     ui.painter().circle_filled(dot.center(), 7.0, ACCENT);
                     ui.label(
-                        egui::RichText::new("Fast Cutter")
+                        egui::RichText::new("rsedit")
                             .strong()
                             .size(22.0)
                             .color(WHITE),
@@ -922,9 +922,8 @@ impl InstallerApp {
                             Phase::Idle => (
                                 "Ready to install".into(),
                                 format!(
-                                    "Fast Cutter {} will be downloaded from the latest \
-                                     official release and installed for this user only.",
-                                    APP_NAME
+                                    "{APP_NAME} will be downloaded from the latest \
+                                     official release and installed for this user only."
                                 ),
                             ),
                             Phase::Querying => {
@@ -956,13 +955,13 @@ impl InstallerApp {
                             Phase::Done { version } => (
                                 format!("Installed {}", version),
                                 format!(
-                                    "Fast Cutter is ready to use. Launch it from {}.",
+                                    "rsedit is ready to use. Launch it from {}.",
                                     self.opts.dir.display()
                                 ),
                             ),
                             Phase::Removing => ("Uninstalling…".into(), "Removing files…".into()),
                             Phase::Removed => {
-                                ("Uninstalled".into(), "Fast Cutter has been removed.".into())
+                                ("Uninstalled".into(), "rsedit has been removed.".into())
                             }
                             Phase::Error { msg } => {
                                 ("Something went wrong".into(), msg.clone())
@@ -1160,7 +1159,7 @@ fn main() -> Result<(), eframe::Error> {
         match remove_install(&dir) {
             Ok(()) => {
                 println!();
-                println!("  Fast Cutter has been removed.");
+                println!("  rsedit has been removed.");
                 println!();
             }
             Err(e) => {
@@ -1173,14 +1172,14 @@ fn main() -> Result<(), eframe::Error> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Fast Cutter Installer")
+            .with_title("rsedit Installer")
             .with_inner_size([620.0, 640.0])
             .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Fast Cutter Installer",
+        "rsedit Installer",
         native_options,
         Box::new(|cc| Ok(Box::new(InstallerApp::new(cc)))),
     )

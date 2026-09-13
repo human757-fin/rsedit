@@ -1,5 +1,5 @@
 //! Preferences / recent-files / autosave persistence to JSON files under the
-//! user config directory (`~/.config/fast-cutter`). Loaded at startup and
+//! user config directory (`~/.config/rsedit`). Loaded at startup and
 //! written whenever settings or recent-files change.
 
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ pub fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("fast-cutter")
+    base.join("rsedit")
 }
 
 fn prefs_path() -> PathBuf {

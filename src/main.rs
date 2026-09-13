@@ -12,19 +12,19 @@ mod render;
 mod text;
 mod timeline;
 
-use crate::app::FastCutterApp;
+use crate::app::RsEditApp;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title("Fast Cutter"),
+            .with_title("rsedit"),
         ..Default::default()
     };
     eframe::run_native(
-        "Fast Cutter",
+        "rsedit",
         options,
-        Box::new(|cc| Ok(Box::new(FastCutterApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(RsEditApp::new(cc)))),
     )
 }

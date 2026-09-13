@@ -1,4 +1,4 @@
-//! Fast Cutter — the editor application itself.
+//! rsedit — the editor application itself.
 //!
 //! Layout: top menu bar + transport bar, left media panel (tabbed, with
 //! drag-and-drop), center preview viewport, right clip inspector, bottom
@@ -216,7 +216,7 @@ enum MediaTab {
 
 // ── Application state ────────────────────────────────────────────────────────
 
-pub struct FastCutterApp {
+pub struct RsEditApp {
     project: Project,
     cache: FrameCache,
     audio: AudioEngine,
@@ -332,7 +332,7 @@ enum PaletteAction {
     Preferences,
 }
 
-impl FastCutterApp {
+impl RsEditApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         ensure_ffmpeg();
         let prefs = crate::prefs::load();
@@ -882,7 +882,7 @@ fn top_video_clip(p: &Project, t: Timecode) -> Option<(usize, &VideoClip)> {
 //  eframe app loop
 // ──────────────────────────────────────────────────────────────────────────────
 
-impl eframe::App for FastCutterApp {
+impl eframe::App for RsEditApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Transport clock driven by audio engine when playing.
         if self.playing {
@@ -1024,7 +1024,7 @@ impl eframe::App for FastCutterApp {
 //  Panels
 // ──────────────────────────────────────────────────────────────────────────────
 
-impl FastCutterApp {
+impl RsEditApp {
     // ── Menu bar ─────────────────────────────────────────────────────────────
     fn menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -3194,7 +3194,7 @@ impl FastCutterApp {
 
     fn prompt_open_project(&mut self) {
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Fast Cutter project", &["rsedit"])
+            .add_filter("rsedit project", &["rsedit"])
             .pick_file()
         {
             self.load_project_file(&p.to_string_lossy().into_owned());
@@ -3244,7 +3244,7 @@ impl FastCutterApp {
             default.push_str(".rsedit");
         }
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Fast Cutter project", &["rsedit"])
+            .add_filter("rsedit project", &["rsedit"])
             .set_file_name(default)
             .save_file()
         {

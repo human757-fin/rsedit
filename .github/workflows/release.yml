@@ -51,9 +51,9 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ steps.version.outputs.value }}"
-          $root = "FastCutter-$ver"
+          $root = "rsedit-$ver"
           New-Item -ItemType Directory -Force -Path $root | Out-Null
-          Copy-Item target\release\fast-cutter.exe "$root\FastCutter.exe"
+          Copy-Item target\release\rsedit.exe "$root\rsedit.exe"
           # Bundle runtime DLLs so the portable zip is self-contained.
           $vcpkgLibs = "$env:VCPKG_ROOT\installed\x64-windows\bin"
           if (Test-Path $vcpkgLibs) {
@@ -68,8 +68,8 @@ jobs:
           Copy-Item README.md "$root\README.md"
           Copy-Item LICENSE "$root\LICENSE.txt"
           Set-Content "$root\version.txt" $ver
-          Compress-Archive -Path "$root\*" -DestinationPath "FastCutter-$ver-windows-portable.zip"
-          Get-ChildItem "FastCutter-$ver-windows-portable.zip" | Select-Object Name, Length
+          Compress-Archive -Path "$root\*" -DestinationPath "rsedit-$ver-windows-portable.zip"
+          Get-ChildItem "rsedit-$ver-windows-portable.zip" | Select-Object Name, Length
 
       - name: Build installer (release)
         run: cargo build --release --manifest-path installer/Cargo.toml
@@ -78,16 +78,16 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ steps.version.outputs.value }}"
-          Copy-Item installer\target\release\fast-cutter-installer.exe "FastCutter-Setup-$ver.exe"
-          Get-ChildItem "FastCutter-Setup-$ver.exe" | Select-Object Name, Length
+          Copy-Item installer\target\release\rsedit-installer.exe "rsedit-Setup-$ver.exe"
+          Get-ChildItem "rsedit-Setup-$ver.exe" | Select-Object Name, Length
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-dist
           path: |
-            FastCutter-${{ steps.version.outputs.value }}-windows-portable.zip
-            FastCutter-Setup-${{ steps.version.outputs.value }}.exe
+            rsedit-${{ steps.version.outputs.value }}-windows-portable.zip
+            rsedit-Setup-${{ steps.version.outputs.value }}.exe
           if-no-files-found: error
 
   build-linux:
@@ -129,14 +129,14 @@ jobs:
         shell: bash
         run: |
           ver="${{ steps.version.outputs.value }}"
-          root="FastCutter-$ver-linux-x86_64"
+          root="rsedit-$ver-linux-x86_64"
           mkdir -p "$root"
-          cp target/release/fast-cutter "$root/FastCutter"
+          cp target/release/rsedit "$root/rsedit"
           cp README.md "$root/README.md"
           cp LICENSE "$root/LICENSE.txt"
           printf '%s\n' "$ver" > "$root/version.txt"
-          tar -czf "FastCutter-$ver-linux-x86_64.tar.gz" "$root"
-          ls -la "FastCutter-$ver-linux-x86_64.tar.gz"
+          tar -czf "rsedit-$ver-linux-x86_64.tar.gz" "$root"
+          ls -la "rsedit-$ver-linux-x86_64.tar.gz"
 
       - name: Build installer (release)
         run: cargo build --release --manifest-path installer/Cargo.toml
@@ -145,36 +145,36 @@ jobs:
         shell: bash
         run: |
           ver="${{ steps.version.outputs.value }}"
-          cp installer/target/release/fast-cutter-installer "FastCutter-Setup-$ver-linux-x86_64"
-          chmod +x "FastCutter-Setup-$ver-linux-x86_64"
-          ls -la "FastCutter-Setup-$ver-linux-x86_64"
+          cp installer/target/release/rsedit-installer "rsedit-Setup-$ver-linux-x86_64"
+          chmod +x "rsedit-Setup-$ver-linux-x86_64"
+          ls -la "rsedit-Setup-$ver-linux-x86_64"
 
       - name: Build AppImage
         shell: bash
         run: |
           ver="${{ steps.version.outputs.value }}"
-          appdir="FastCutter.AppDir"
+          appdir="rsedit.AppDir"
           mkdir -p "$appdir/usr/bin"
-          cp target/release/fast-cutter "$appdir/usr/bin/fast-cutter"
-          cp packaging/fast-cutter.desktop "$appdir/fast-cutter.desktop"
-          cp packaging/fast-cutter.png "$appdir/fast-cutter.png"
+          cp target/release/rsedit "$appdir/usr/bin/rsedit"
+          cp packaging/rsedit.desktop "$appdir/rsedit.desktop"
+          cp packaging/rsedit.png "$appdir/rsedit.png"
           cp packaging/AppRun "$appdir/AppRun"
-          chmod +x "$appdir/AppRun" "$appdir/usr/bin/fast-cutter"
+          chmod +x "$appdir/AppRun" "$appdir/usr/bin/rsedit"
 
           curl -sL -o /tmp/appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x /tmp/appimagetool
-          /tmp/appimagetool --appimage-extract-and-run "$appdir" "FastCutter-$ver-x86_64.AppImage"
-          ls -la "FastCutter-$ver-x86_64.AppImage"
+          /tmp/appimagetool --appimage-extract-and-run "$appdir" "rsedit-$ver-x86_64.AppImage"
+          ls -la "rsedit-$ver-x86_64.AppImage"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-dist
           path: |
-            FastCutter-${{ steps.version.outputs.value }}-linux-x86_64.tar.gz
-            FastCutter-${{ steps.version.outputs.value }}-x86_64.AppImage
-            FastCutter-Setup-${{ steps.version.outputs.value }}-linux-x86_64
+            rsedit-${{ steps.version.outputs.value }}-linux-x86_64.tar.gz
+            rsedit-${{ steps.version.outputs.value }}-x86_64.AppImage
+            rsedit-Setup-${{ steps.version.outputs.value }}-linux-x86_64
           if-no-files-found: error
 
   release:
@@ -195,7 +195,7 @@ jobs:
       - name: Generate checksums
         shell: bash
         run: |
-          (cd dist && sha256sum FastCutter-* > SHA256SUMS.txt)
+          (cd dist && sha256sum rsedit-* > SHA256SUMS.txt)
           cat dist/SHA256SUMS.txt
 
       - name: Determine tag name
@@ -212,9 +212,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          name: Fast Cutter ${{ steps.tag.outputs.name }}
+          name: rsedit ${{ steps.tag.outputs.name }}
           body: |
-            ## Fast Cutter
+            ## rsedit
 
             Full MVP: timeline, video/image/audio import, text overlays, audio mixing with fades/gain, and MP4 export.
 
@@ -222,11 +222,11 @@ jobs:
 
             | File | Description |
             |---|---|
-            | `FastCutter-Setup-*.exe` | Windows GUI installer — downloads the latest portable build from GitHub, installs per-user (no admin), with togglable Start Menu + desktop shortcuts. |
-            | `FastCutter-*-windows-portable.zip` | Windows portable build (includes runtime FFmpeg DLLs). |
-            | `FastCutter-Setup-*-linux-x86_64` | Linux GUI installer — same flow: app-menu + desktop shortcut toggles. |
-            | `FastCutter-*-linux-x86_64.tar.gz` | Linux portable build. Requires `libavcodec` etc. on the system. |
-            | `FastCutter-*-x86_64.AppImage` | Linux AppImage. Self-contained, runs on most distros. |
+            | `rsedit-Setup-*.exe` | Windows GUI installer — downloads the latest portable build from GitHub, installs per-user (no admin), with togglable Start Menu + desktop shortcuts. |
+            | `rsedit-*-windows-portable.zip` | Windows portable build (includes runtime FFmpeg DLLs). |
+            | `rsedit-Setup-*-linux-x86_64` | Linux GUI installer — same flow: app-menu + desktop shortcut toggles. |
+            | `rsedit-*-linux-x86_64.tar.gz` | Linux portable build. Requires `libavcodec` etc. on the system. |
+            | `rsedit-*-x86_64.AppImage` | Linux AppImage. Self-contained, runs on most distros. |
 
             Verification: `SHA256SUMS.txt` contains checksums for every archive.
 
@@ -234,15 +234,15 @@ jobs:
 
             ```sh
             # Windows
-            .\FastCutter-Setup-*.exe
+            .\rsedit-Setup-*.exe
             # Linux
-            chmod +x FastCutter-Setup-*-linux-x86_64 && ./FastCutter-Setup-*-linux-x86_64
+            chmod +x rsedit-Setup-*-linux-x86_64 && ./rsedit-Setup-*-linux-x86_64
             ```
 
             The installer fetches the latest portable build straight from this
             repository's Release page and installs for the current user only —
-            Windows: `%LOCALAPPDATA%\Programs\FastCutter`, Linux:
-            `~/.local/share/FastCutter`. From the GUI you can toggle a
+            Windows: `%LOCALAPPDATA%\Programs\rsedit`, Linux:
+            `~/.local/share/rsedit`. From the GUI you can toggle a
             Start Menu (Windows) / applications-menu (Linux) shortcut and a
             desktop shortcut. Windows also registers a per-user Uninstall entry,
             and a headless `--uninstall` flag is supported by both.
@@ -252,15 +252,15 @@ jobs:
             ```sh
             # Ubuntu/Debian: install runtime libs
             sudo apt install libavcodec61 libavformat61 libswscale8 libavfilter10 libswresample5
-            tar -xzf FastCutter-*-linux-x86_64.tar.gz
-            ./FastCutter-*/FastCutter
+            tar -xzf rsedit-*-linux-x86_64.tar.gz
+            ./rsedit-*/rsedit
             ```
 
             ### Linux (AppImage)
 
             ```sh
-            chmod +x FastCutter-*-x86_64.AppImage
-            ./FastCutter-*-x86_64.AppImage
+            chmod +x rsedit-*-x86_64.AppImage
+            ./rsedit-*-x86_64.AppImage
             ```
           files: |
             dist/*

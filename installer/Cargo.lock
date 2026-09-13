@@ -1197,21 +1197,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fast-cutter-installer"
-version = "0.1.1"
-dependencies = [
- "eframe",
- "flate2",
- "rfd",
- "serde",
- "serde_json",
- "tar",
- "ureq",
- "winreg",
- "zip",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2856,6 +2841,21 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rsedit-installer"
+version = "0.2.0"
+dependencies = [
+ "eframe",
+ "flate2",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tar",
+ "ureq",
+ "winreg",
+ "zip",
 ]
 
 [[package]]

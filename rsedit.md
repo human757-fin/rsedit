@@ -1,4 +1,4 @@
-# Fast Cutter — Technical Spec (v0.1 draft)
+# rsedit — Technical Spec (v0.1 draft)
 
 A minimal, fast, cross-platform video editor. Not a Resolve replacement — a
 lightweight cutting tool with basic audio, image/transparency, and subtitle

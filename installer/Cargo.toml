@@ -1,8 +1,8 @@
 [package]
-name = "fast-cutter-installer"
-version = "0.1.1"
+name = "rsedit-installer"
+version = "0.2.0"
 edition = "2021"
-description = "Fast Cutter GUI installer"
+description = "rsedit GUI installer"
 license = "MIT"
 
 [dependencies]

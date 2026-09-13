@@ -1,9 +1,9 @@
 [package]
-name = "fast-cutter"
+name = "rsedit"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Fast Cutter - a minimal, fast, cross-platform video editor"
+description = "rsedit - a minimal, fast, cross-platform video editor"
 license = "MIT"
 
 [dependencies]
