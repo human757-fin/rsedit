@@ -7,6 +7,7 @@ mod decoder;
 mod export;
 mod fonts;
 mod framecache;
+mod prefs;
 mod render;
 mod text;
 mod timeline;

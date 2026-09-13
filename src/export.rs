@@ -24,56 +24,71 @@ pub struct ExportConfig {
     pub height: u32,
     pub fps: f64,
     pub bitrate_kbps: u32,
+    pub audio_only: bool,
+    /// Use the VP9 encoder instead of H.264.
+    pub vp9: bool,
+    /// Export the `[from_us, to_us)` segment only. `to_us <= from_us` = full range.
+    pub from_us: i64,
+    pub to_us: i64,
 }
 
-/// Render the whole timeline to the configured file. `progress` receives 0..1.
+/// Render the (configured segment of the) timeline to the configured file.
+/// `progress` receives 0..1; `cancel` aborts with an error when raised.
 pub fn export_project(
     project: &Project,
     cfg: &ExportConfig,
+    cancel: &std::sync::atomic::AtomicBool,
     progress: &mut dyn FnMut(f32),
 ) -> Result<()> {
     if project.duration_us() <= 0 {
         bail!("timeline is empty");
     }
+    let from = cfg.from_us.max(0).min(project.duration_us());
+    let to = if cfg.to_us > cfg.from_us {
+        cfg.to_us.min(project.duration_us())
+    } else {
+        project.duration_us()
+    };
+    let seg_len = (to - from).max(1);
 
     let rate_us: i64 = (1_000_000.0 / cfg.fps) as i64;
-    let total_frames = ((project.duration_us() as f64 / rate_us as f64).ceil() as u64).max(1);
+    let total_frames = ((seg_len as f64 / rate_us as f64).ceil() as u64).max(1);
+
+    let vcodec = if cfg.vp9 {
+        ffmpeg::codec::encoder::find(CodecId::VP9).context("VP9 encoder not available")
+    } else {
+        ffmpeg::codec::encoder::find(CodecId::H264).context("H264 encoder not available")
+    };
 
     let mut octx = ffmpeg::format::output(&cfg.path)
         .with_context(|| format!("cannot create {}", cfg.path))?;
 
-    // ---- Video ----
-    let vcodec =
-        ffmpeg::codec::encoder::find(CodecId::H264).context("H264 encoder not available")?;
-    let mut vstream = octx.add_stream(vcodec).context("add H264 stream")?;
-    let mut venc = ffmpeg::codec::context::Context::from_parameters(vstream.parameters())?
-        .encoder()
-        .video()?;
-    venc.set_width(cfg.width);
-    venc.set_height(cfg.height);
-    venc.set_format(Pixel::YUV420P);
-    venc.set_frame_rate(Some(ffmpeg::Rational(cfg.fps as i32, 1)));
-    venc.set_time_base(ffmpeg::Rational(1, cfg.fps.max(1.0) as i32));
-    let mut venc = {
-        let mut opts = ffmpeg::Dictionary::new();
-        opts.set("preset", "medium");
-        opts.set("b", &format!("{}k", cfg.bitrate_kbps));
-        venc.open_with(opts).context("open H264 encoder")?
-    };
-    vstream.set_parameters(&venc);
-
-    let vstream_idx = vstream.index();
-    let vtb = vstream.time_base();
-    let mut scaler = ScalingContext::get(
-        Pixel::RGBA,
-        cfg.width,
-        cfg.height,
-        Pixel::YUV420P,
-        cfg.width,
-        cfg.height,
-        ScaleFlags::BILINEAR,
-    )
-    .context("build RGBA->YUV420P scaler")?;
+    // ---- Video (skipped for audio-only exports) ----
+    let mut venc: Option<ffmpeg::codec::encoder::Video> = None;
+    let mut videotb: Option<ffmpeg::Rational> = None;
+    let mut vstream_idx = usize::MAX;
+    if !cfg.audio_only {
+        let vcodec = vcodec?;
+        let mut vstream = octx.add_stream(vcodec).context("add video stream")?;
+        let mut enc = ffmpeg::codec::context::Context::from_parameters(vstream.parameters())?
+            .encoder()
+            .video()?;
+        enc.set_width(cfg.width);
+        enc.set_height(cfg.height);
+        enc.set_format(Pixel::YUV420P);
+        enc.set_frame_rate(Some(ffmpeg::Rational(cfg.fps as i32, 1)));
+        enc.set_time_base(ffmpeg::Rational(1, cfg.fps.max(1.0) as i32));
+        let enc = {
+            let mut opts = ffmpeg::Dictionary::new();
+            opts.set("preset", "medium");
+            opts.set("b", &format!("{}k", cfg.bitrate_kbps));
+            enc.open_with(opts).context("open video encoder")?
+        };
+        vstream.set_parameters(&enc);
+        vstream_idx = vstream.index();
+        videotb = Some(vstream.time_base());
+        venc = Some(enc);
+    }
 
     // ---- Audio ----
     let mut audio_out = octx
@@ -103,32 +118,61 @@ pub fn export_project(
 
     let mix = build_snapshot(project);
     let mut dec = ExportDecoder::new(project, cfg.width, cfg.height);
-    let total_samples = ((project.duration_us() as f64 * 48_000.0 / 1_000_000.0) as usize)
-        .max(1);
+    let total_samples = ((seg_len as f64 * 48_000.0 / 1_000_000.0) as usize).max(1);
+
+    // We need a scaler even in audio-only mode only for video; keep it optional.
+    let mut scaler = if cfg.audio_only {
+        None
+    } else {
+        Some(
+            ScalingContext::get(
+                Pixel::RGBA,
+                cfg.width,
+                cfg.height,
+                Pixel::YUV420P,
+                cfg.width,
+                cfg.height,
+                ScaleFlags::BILINEAR,
+            )
+            .context("build RGBA->YUV420P scaler")?,
+        )
+    };
 
     // ---- Encode loop ----
     for f in 0..total_frames {
-        let pts_us = (f as i64 * rate_us) as i64;
-        let rgba = composition_frame(project, &mut dec, pts_us, cfg.width, cfg.height)?;
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("export cancelled");
+        }
+        let pts_us = from + (f as i64 * rate_us);
+        if !cfg.audio_only {
+            let rgba = composition_frame(project, &mut dec, pts_us, cfg.width, cfg.height)?;
 
-        let mut src_rgba = ffmpeg::frame::Video::new(Pixel::RGBA, cfg.width, cfg.height);
-        src_rgba.data_mut(0).copy_from_slice(&rgba);
-        src_rgba.set_format(Pixel::RGBA);
+            let mut src_rgba = ffmpeg::frame::Video::new(Pixel::RGBA, cfg.width, cfg.height);
+            src_rgba.data_mut(0).copy_from_slice(&rgba);
+            src_rgba.set_format(Pixel::RGBA);
 
-        let mut yuv = ffmpeg::frame::Video::empty();
-        scaler.run(&src_rgba, &mut yuv).context("scale frame")?;
-        yuv.set_kind(ffmpeg::picture::Type::None);
-        yuv.set_pts(Some(f as i64));
-        venc.send_frame(&yuv).context("send video frame")?;
-        drain_video(&mut venc, &mut octx, f as i64, vtb, vstream_idx)?;
+            let mut yuv = ffmpeg::frame::Video::empty();
+            if let Some(sc) = scaler.as_mut() {
+                sc.run(&src_rgba, &mut yuv).context("scale frame")?;
+            }
+            yuv.set_kind(ffmpeg::picture::Type::None);
+            yuv.set_pts(Some(f as i64));
+            if let Some(enc) = venc.as_mut() {
+                enc.send_frame(&yuv).context("send video frame")?;
+                let vt = videotb.unwrap();
+                drain_video(enc, &mut octx, f as i64, vt, vstream_idx)?;
+            }
+        }
 
-        // Audio for this video frame's time span.
-        let s0 = ((f as i64 * rate_us) as f64 * 48_000.0 / 1_000_000.0) as usize;
-        let s1 = (((f + 1) as i64 * rate_us) as f64 * 48_000.0 / 1_000_000.0) as usize;
-        let mut s = s0.min(total_samples);
-        let span_end = s1.min(total_samples);
+        // Audio for this frame's time span.
+        let s0 = ((from as i64 as f64 + (f as i64 * rate_us) as f64) * 48_000.0 / 1_000_000.0)
+            as usize;
+        let s0_base = (from as i64 as f64 * 48_000.0 / 1_000_000.0) as usize;
+        let s1 = (((from as i64 + (f + 1) as i64 * rate_us) as f64).min(to as f64) * 48_000.0
+            / 1_000_000.0) as usize;
+        let mut s = s0.max(s0_base);
+        let span_end = s1.min(total_samples + s0_base);
         while s < span_end {
-            // Send full sample chunks; pad the final partial chunk with silence.
             let take = (span_end - s).min(sample_chunk);
             let mut samples = vec![0.0f32; sample_chunk * 2];
             let chunk = mix_span(&mix, s, take, 48_000);
@@ -154,8 +198,10 @@ pub fn export_project(
     }
 
     // Flush encoders.
-    venc.send_eof()?;
-    drain_video(&mut venc, &mut octx, total_frames as i64, vtb, vstream_idx)?;
+    if let Some(enc) = venc.as_mut() {
+        enc.send_eof()?;
+        drain_video(enc, &mut octx, total_frames as i64, videotb.unwrap(), vstream_idx)?;
+    }
     aenc.send_eof()?;
     drain_audio(&mut aenc, &mut octx, total_samples as i64, atb, astream_idx)?;
 

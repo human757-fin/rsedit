@@ -108,11 +108,27 @@ impl Keybinds {
     fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// Serialize all binds as `(label, ctrl, shift, alt, key name)` for prefs.
+    fn binds(&self) -> Vec<(String, bool, bool, bool, String)> {
+        BIND_ROWS
+            .iter()
+            .map(|(label, f)| {
+                let sc = self.get(*f);
+                (
+                    (*label).to_string(),
+                    sc.modifiers.ctrl,
+                    sc.modifiers.shift,
+                    sc.modifiers.alt,
+                    format!("{:?}", sc.logical_key),
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
-enum BindField {
+pub(crate) enum BindField {
     PlayPause,
     StepBack,
     StepFwd,
@@ -132,13 +148,19 @@ enum BindField {
 
 // ── Global application settings ──────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-struct Settings {
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Settings {
     show_peaks: bool,
     dark_mode: bool,
     snap_to_playhead: bool,
     preview_width: u32,
     preview_height: u32,
+    #[serde(default)]
+    safe_margins: bool,
+    #[serde(default)]
+    accent: [u8; 3],
+    #[serde(default)]
+    autosave: bool,
 }
 
 impl Default for Settings {
@@ -149,6 +171,9 @@ impl Default for Settings {
             snap_to_playhead: true,
             preview_width: 1280,
             preview_height: 720,
+            safe_margins: false,
+            accent: [240, 120, 64],
+            autosave: true,
         }
     }
 }
@@ -201,6 +226,8 @@ pub struct FastCutterApp {
     preview_texture: Option<egui::TextureHandle>,
     preview_rendered_pts: Option<i64>,
     selected: Selection,
+    multi_selection: Vec<Selection>,
+    clipboard: Option<ClipboardItem>,
     // UI state
     media_tab: MediaTab,
     media_filter: String,
@@ -211,19 +238,43 @@ pub struct FastCutterApp {
     capturing: Option<BindField>,
     keybinds: Keybinds,
     settings: Settings,
+    // Timeline view state
+    timeline_scroll_us: Timecode,
+    timeline_zoom: f32,
+    timeline_drag: Option<TimelineDrag>,
     // Export dialog
     export_open: bool,
     export_path: String,
     export_w: u32,
     export_h: u32,
     export_fps: f64,
+    export_bitrate: u32,
+    export_codec: u8,
+    export_audio_only: bool,
+    export_range: bool,
     export_msg: Option<String>,
+    export_worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    export_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    export_progress_cell: std::sync::Arc<std::sync::Mutex<f32>>,
+    export_running: bool,
+    export_progress: f32,
     /// Source fps awaiting user confirmation to adopt as the project fps.
     pending_fps: Option<f64>,
     toasts: Vec<(String, Instant)>,
+    // Windows / overlays
+    mixer_open: bool,
+    palette_open: bool,
+    palette_filter: String,
+    palette_sel: usize,
+    fullscreen_preview: bool,
+    relink_open: bool,
+    recent_files: Vec<String>,
     // Undo / redo stacks
     undo_stack: Vec<Project>,
     redo_stack: Vec<Project>,
+    // Autosave
+    autosave_timer: Instant,
+    dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,14 +291,53 @@ impl Default for Selection {
     }
 }
 
+#[derive(Clone)]
+enum ClipboardItem {
+    Video(VideoClip),
+    Audio(AudioClip),
+    Text(TextClip),
+}
+
+#[derive(Clone, Copy)]
+enum TimelineDrag {
+    Move { kind: u8, track: usize, clip: usize, grab_us: i64 },
+    TrimL { kind: u8, track: usize, clip: usize },
+    TrimR { kind: u8, track: usize, clip: usize },
+}
+
 impl FastCutterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         ensure_ffmpeg();
-        apply_theme(&cc.egui_ctx, true);
+        let prefs = crate::prefs::load();
+        let settings = prefs
+            .as_ref()
+            .map(|p| p.settings)
+            .unwrap_or_default();
+        let keybinds = prefs
+            .as_ref()
+            .map(|p| {
+                let mut kb = Keybinds::default();
+                for (name, ctrl, shift, alt, key) in &p.keybinds {
+                    if let Some(f) = crate::prefs::keybind_field(name) {
+                        if let Some(k) = crate::prefs::key_from_str(key) {
+                            let mut m = Modifiers::NONE;
+                            m.ctrl = *ctrl;
+                            m.shift = *shift;
+                            m.alt = *alt;
+                            kb.set(f, KeyboardShortcut::new(m, k));
+                        }
+                    }
+                }
+                kb
+            })
+            .unwrap_or_default();
+        let dark = settings.dark_mode;
+        apply_theme(&cc.egui_ctx, dark, settings.accent);
         let project = Project::new();
         let audio = AudioEngine::new(&project);
         let cache = FrameCache::new();
-        Self {
+        let recent = prefs.as_ref().map(|p| p.recent.clone()).unwrap_or_default();
+        let mut app = Self {
             project,
             cache,
             audio,
@@ -257,6 +347,8 @@ impl FastCutterApp {
             preview_texture: None,
             preview_rendered_pts: None,
             selected: Selection::None,
+            multi_selection: Vec::new(),
+            clipboard: None,
             media_tab: MediaTab::All,
             media_filter: String::new(),
             thumbnails: HashMap::new(),
@@ -264,19 +356,47 @@ impl FastCutterApp {
             drag_timeline_us: None,
             settings_open: false,
             capturing: None,
-            keybinds: Keybinds::default(),
-            settings: Settings::default(),
+            keybinds,
+            settings,
+            timeline_scroll_us: 0,
+            timeline_zoom: 1.0,
+            timeline_drag: None,
             export_open: false,
             export_path: "out.mp4".into(),
             export_w: 1920,
             export_h: 1080,
             export_fps: 30.0,
+            export_bitrate: 8000,
+            export_codec: 0,
+            export_audio_only: false,
+            export_range: false,
             export_msg: None,
-            toasts: Vec::new(),
+            export_worker: None,
+            export_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            export_progress_cell: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            export_running: false,
+            export_progress: 0.0,
             pending_fps: None,
+            toasts: Vec::new(),
+            mixer_open: false,
+            palette_open: false,
+            palette_filter: String::new(),
+            palette_sel: 0,
+            fullscreen_preview: false,
+            relink_open: false,
+            recent_files: recent,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            autosave_timer: Instant::now(),
+            dirty: false,
+        };
+        // Attempt to recover an autosaved project.
+        if let Some(p) = crate::prefs::load_autosave() {
+            app.project = p;
+            app.audio.refresh(&app.project);
+            app.toasts.push(("Recovered autosaved project".into(), Instant::now()));
         }
+        app
     }
 
     fn push_undo(&mut self) {
@@ -285,6 +405,11 @@ impl FastCutterApp {
         if self.undo_stack.len() > 100 {
             self.undo_stack.remove(0);
         }
+    }
+
+    fn accent(&self) -> Color32 {
+        let a = self.settings.accent;
+        Color32::from_rgb(a[0], a[1], a[2])
     }
 
     fn undo(&mut self) {
@@ -1723,61 +1848,151 @@ impl FastCutterApp {
     // ── Export dialog ────────────────────────────────────────────────────────
     fn export_window(&mut self, ctx: &egui::Context) {
         let mut open = self.export_open;
+        let msg = self.export_msg.clone();
         egui::Window::new("Export")
             .open(&mut open)
             .collapsible(false)
+            .default_width(420.0)
             .show(ctx, |ui| {
-                ui.label("Render the timeline to MP4 (H.264 + AAC).");
-                ui.horizontal(|ui| {
-                    ui.label("File:");
-                    ui.text_edit_singleline(&mut self.export_path);
-                    if ui.button("Browse").clicked() {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("MP4", &["mp4"])
-                            .set_file_name("out.mp4")
-                            .save_file()
+                if self.export_running {
+                    ui.label("Rendering…");
+                    ui.add(
+                        egui::ProgressBar::new(self.export_progress)
+                            .desired_width(ui.available_width()),
+                    );
+                    if ui.button("Cancel").clicked() {
+                        self.export_cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    ui.label("Render the timeline to a video or audio file.");
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.text_edit_singleline(&mut self.export_path);
+                        if ui.button("Browse").clicked() {
+                            let filter = if self.export_audio_only { "m4a" } else { "mp4" };
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("out", &[filter])
+                                .set_file_name(if self.export_audio_only { "out.m4a" } else { "out.mp4" })
+                                .save_file()
+                            {
+                                self.export_path = p.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    const PRESETS: [(&str, u32, u32, f64); 5] = [
+                        ("1080p 30", 1920, 1080, 30.0),
+                        ("1080p 60", 1920, 1080, 60.0),
+                        ("4K 30", 3840, 2160, 30.0),
+                        ("9:16 1080p", 1080, 1920, 30.0),
+                        ("Custom", 0, 0, 0.0),
+                    ];
+                    let mut preset_idx = PRESETS.len() - 1;
+                    for (i, (name, w, h, f)) in PRESETS.iter().enumerate() {
+                        if *name != "Custom" && self.export_w == *w && self.export_h == *h
+                            && (self.export_fps - f).abs() < 0.01
                         {
-                            self.export_path = p.to_string_lossy().into_owned();
+                            preset_idx = i;
+                            break;
                         }
                     }
-                });
-                egui::Grid::new("export_grid").num_columns(2).show(ui, |inner| {
-                    inner.label("Width");
-                    inner.add(egui::DragValue::new(&mut self.export_w).range(320..=3840));
-                    inner.end_row();
-                    inner.label("Height");
-                    inner.add(egui::DragValue::new(&mut self.export_h).range(240..=2160));
-                    inner.end_row();
-                    inner.label("FPS");
-                    inner.add(egui::DragValue::new(&mut self.export_fps).range(10.0..=60.0));
-                    inner.end_row();
-                });
-                if ui
-                    .add_sized([120.0, 30.0], egui::Button::new("Render").fill(ACCENT))
-                    .on_hover_text("Renders the full timeline (blocking, can take a while)")
-                    .clicked()
-                {
-                    let project = self.project.clone();
-                    let cfg = crate::export::ExportConfig {
-                        path: self.export_path.clone(),
-                        width: self.export_w,
-                        height: self.export_h,
-                        fps: self.export_fps,
-                        bitrate_kbps: 8000,
-                    };
-                    let result = std::thread::spawn(move || {
-                        crate::export::export_project(&project, &cfg, &mut |_p| {})
-                    })
-                    .join();
-                    match result {
-                        Ok(Ok(())) => self.export_msg = Some("Export complete.".into()),
-                        Ok(Err(e)) => self.export_msg = Some(format!("Export failed: {e:#}")),
-                        Err(_) => self.export_msg = Some("Export thread panicked.".into()),
+                    egui::ComboBox::from_label("Preset")
+                        .selected_text(PRESETS[preset_idx].0)
+                        .show_ui(ui, |ui| {
+                            for (i, (name, w, h, f)) in PRESETS.iter().enumerate() {
+                                if ui.selectable_label(preset_idx == i, *name).clicked() {
+                                    if *name != "Custom" {
+                                        self.export_w = *w;
+                                        self.export_h = *h;
+                                        self.export_fps = *f;
+                                    }
+                                }
+                            }
+                        });
+
+                    ui.checkbox(&mut self.export_audio_only, "Audio only (no video)");
+                    if !self.export_audio_only {
+                        egui::Grid::new("export_grid").num_columns(2).show(ui, |inner| {
+                            inner.label("Width");
+                            inner.add(egui::DragValue::new(&mut self.export_w).range(320..=3840));
+                            inner.end_row();
+                            inner.label("Height");
+                            inner.add(egui::DragValue::new(&mut self.export_h).range(240..=2160));
+                            inner.end_row();
+                        });
+                        egui::ComboBox::from_label("Codec")
+                            .selected_text(if self.export_codec == 1 { "VP9" } else { "H.264" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.export_codec, 0, "H.264");
+                                ui.selectable_value(&mut self.export_codec, 1, "VP9");
+                            });
+                    }
+                    egui::Grid::new("export_grid2").num_columns(2).show(ui, |inner| {
+                        inner.label("FPS");
+                        inner.add(egui::DragValue::new(&mut self.export_fps).range(10.0..=60.0));
+                        inner.end_row();
+                        if !self.export_audio_only {
+                            inner.label("Bitrate (kbps)");
+                            inner.add(egui::DragValue::new(&mut self.export_bitrate).range(500..=40000));
+                            inner.end_row();
+                        }
+                    });
+                    let has_loop = self.project.loop_start.is_some() && self.project.loop_end.is_some();
+                    ui.add_enabled(
+                        has_loop,
+                        egui::Checkbox::new(&mut self.export_range, "Export loop region only"),
+                    );
+                    let clickable = self.export_path.is_empty()
+                        || (self.export_audio_only
+                            && !self.export_path.to_lowercase().ends_with(".m4a"));
+                    if ui
+                        .add_enabled(
+                            !clickable,
+                            egui::Button::new("Render").fill(self.accent()),
+                        )
+                        .clicked()
+                    {
+                        let project = self.project.clone();
+                        let (from_us, to_us) = if self.export_range {
+                            (
+                                self.project.loop_start.unwrap_or(0),
+                                self.project.loop_end.unwrap_or(0),
+                            )
+                        } else {
+                            (0, 0)
+                        };
+                        let mut path = self.export_path.clone();
+                        if self.export_audio_only && !path.to_lowercase().ends_with(".m4a") {
+                            path = path.replace(".mp4", ".m4a");
+                        }
+                        let cfg = crate::export::ExportConfig {
+                            path,
+                            width: self.export_w,
+                            height: self.export_h,
+                            fps: self.export_fps,
+                            bitrate_kbps: self.export_bitrate,
+                            audio_only: self.export_audio_only,
+                            vp9: self.export_codec == 1,
+                            from_us,
+                            to_us,
+                        };
+                        self.export_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                        *self.export_progress_cell.lock().unwrap() = 0.0;
+                        self.export_progress = 0.0;
+                        self.export_msg = None;
+                        self.export_running = true;
+                        let cancel = self.export_cancel.clone();
+                        let cell = self.export_progress_cell.clone();
+                        self.export_worker = Some(std::thread::spawn(move || {
+                            crate::export::export_project(&project, &cfg, &cancel, &mut |p| {
+                                *cell.lock().unwrap() = p;
+                            })
+                        }));
                     }
                 }
-                if let Some(msg) = &self.export_msg {
+                if let Some(m) = &msg {
                     ui.separator();
-                    ui.label(msg);
+                    ui.label(m);
                 }
             });
         self.export_open = open;
@@ -1787,6 +2002,7 @@ impl FastCutterApp {
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
         let prev_dark = self.settings.dark_mode;
+        let prev_accent = self.settings.accent;
         let mut reset_binds = false;
         let mut request_close = false;
         egui::Window::new("Preferences")
@@ -1836,6 +2052,20 @@ impl FastCutterApp {
                     &mut self.settings.snap_to_playhead,
                     "Snap media drops to the playhead",
                 );
+                ui.checkbox(&mut self.settings.autosave, "Autosave project");
+                ui.checkbox(&mut self.settings.safe_margins, "Show safe margins in preview");
+                ui.horizontal(|ui| {
+                    ui.label("Accent color");
+                    let mut c = egui::Color32::from_rgb(
+                        self.settings.accent[0],
+                        self.settings.accent[1],
+                        self.settings.accent[2],
+                    );
+                    if ui.color_edit_button_srgba(&mut c).changed() {
+                        self.settings.accent = [c.r(), c.g(), c.b()];
+                    }
+                    ui.label("Theme accent applies to selections and highlights.");
+                });
                 ui.horizontal(|ui| {
                     ui.label("Preview render size");
                     ui.add(
@@ -1859,8 +2089,13 @@ impl FastCutterApp {
             self.capturing = None;
             self.toasts.push(("Keybinds reset to defaults".into(), Instant::now()));
         }
-        if prev_dark != self.settings.dark_mode {
-            apply_theme(ctx, self.settings.dark_mode);
+        if prev_dark != self.settings.dark_mode || prev_accent != self.settings.accent {
+            apply_theme(ctx, self.settings.dark_mode, self.settings.accent);
+            let _ = crate::prefs::write_config(
+                self.settings,
+                &self.keybinds.binds(),
+                &self.recent_files,
+            );
             self.toasts.push((
                 if self.settings.dark_mode {
                     "Dark mode enabled".into()
@@ -1983,9 +2218,22 @@ const TEXT_CLIP: Color32 = Color32::from_rgb(120, 90, 150);
 const WAVE: Color32 = Color32::from_rgb(120, 220, 170);
 const PLAYHEAD: Color32 = Color32::from_rgb(255, 80, 80);
 
-fn apply_theme(ctx: &egui::Context, dark: bool) {
+fn apply_theme(ctx: &egui::Context, dark: bool, accent: [u8; 3]) {
     let mut style = (*ctx.style()).clone();
     style.visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let sel_bg = if dark {
+        Color32::from_rgb(
+            (accent[0] as u32 * 45 / 100 + 10) as u8,
+            (accent[1] as u32 * 45 / 100 + 10) as u8,
+            (accent[2] as u32 * 45 / 100 + 10) as u8,
+        )
+    } else {
+        Color32::from_rgb(
+            (accent[0] as u16 / 2 + 127) as u8,
+            (accent[1] as u16 / 2 + 127) as u8,
+            (accent[2] as u16 / 2 + 127) as u8,
+        )
+    };
     if dark {
         style.visuals.panel_fill = PANEL;
         style.visuals.window_fill = PANEL;
@@ -1996,7 +2244,6 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
         style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, WHITE);
         style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, WHITE);
         style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, WHITE);
-        style.visuals.selection.bg_fill = Color32::from_rgb(40, 80, 140);
     } else {
         let fg = Color32::from_rgb(20, 20, 26);
         style.visuals.panel_fill = Color32::from_rgb(243, 243, 248);
@@ -2008,8 +2255,8 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
         style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, fg);
         style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, fg);
         style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, fg);
-        style.visuals.selection.bg_fill = Color32::from_rgb(160, 200, 255);
     }
+    style.visuals.selection.bg_fill = sel_bg;
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     style.spacing.button_padding = egui::vec2(8.0, 3.0);
     ctx.set_style(style);

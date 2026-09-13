@@ -484,12 +484,12 @@ impl Project {
         let mut end = 0;
         for t in &self.video_tracks {
             for c in &t.clips {
-                end = end.max(c.timeline_start + (c.source_out - c.source_in));
+                end = end.max(c.timeline_start + c.on_timeline_us());
             }
         }
         for t in &self.audio_tracks {
             for c in &t.clips {
-                end = end.max(c.timeline_start + (c.source_out - c.source_in));
+                end = end.max(c.timeline_start + c.on_timeline_us());
             }
         }
         for t in &self.text_tracks {
@@ -509,7 +509,7 @@ impl Project {
                 continue;
             }
             for c in &track.clips {
-                let end = c.timeline_start + (c.source_out - c.source_in);
+                let end = c.timeline_start + c.on_timeline_us();
                 if c.timeline_start <= t && t < end {
                     out.push((ti, c));
                 }
@@ -526,7 +526,7 @@ impl Project {
                 continue;
             }
             for c in &track.clips {
-                let end = c.timeline_start + (c.source_out - c.source_in);
+                let end = c.timeline_start + c.on_timeline_us();
                 if c.timeline_start <= t && t < end {
                     out.push((ti, c));
                 }
